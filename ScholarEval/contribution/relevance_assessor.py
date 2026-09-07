@@ -17,7 +17,7 @@ def main():
     parser.add_argument("--llm_engine", required=True)
     parser.add_argument("--litellm_name", help="LiteLLM model name for cost calculation (e.g., 'claude-sonnet-4-20250514')")
     parser.add_argument("--output_file", required=True)
-    parser.add_argument("--max_workers", type=int, default=5, help="Maximum number of parallel workers")
+    parser.add_argument("--max_workers", type=int, default=1, help="Maximum number of parallel workers")
     parser.add_argument("--cost_log_file", help="Path to centralized cost log file")
     args = parser.parse_args()
 
@@ -166,6 +166,31 @@ def main():
             logging.info("  -> Score: 0 (parsing failed)")
             return paper_with_assessment
 
+    # PARTIAL_RELEVANCE_RESUME_V1
+    # Recover per-paper results left by an interrupted previous run.
+    if os.path.exists(args.output_file):
+        try:
+            with open(args.output_file, "r", encoding="utf-8") as f:
+                previous_output = json.load(f)
+
+            previous_scored = {
+                item.get("paperId"): item
+                for item in previous_output.get("papers", [])
+                if item.get("paperId") and "relevance_score" in item
+            }
+
+            if previous_scored:
+                papers = [
+                    previous_scored.get(item.get("paperId"), item)
+                    for item in papers
+                ]
+                logging.info(
+                    f"Recovered {len(previous_scored)} previously scored papers "
+                    "from partial output"
+                )
+        except (OSError, ValueError, TypeError):
+            logging.warning("Ignoring unreadable partial relevance output")
+
     # Filter out papers with null abstracts before processing
     papers_with_abstracts = [paper for paper in papers if paper.get('abstract')]
     logging.info(f"Filtered out {len(papers) - len(papers_with_abstracts)} papers with null abstracts")
@@ -178,6 +203,17 @@ def main():
     
     # Process papers that need scoring in parallel
     relevant = already_scored.copy()  # Start with already scored papers
+
+    def persist_partial():
+        temp_path = args.output_file + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {"papers": relevant},
+                f,
+                indent=2,
+                ensure_ascii=False
+            )
+        os.replace(temp_path, args.output_file)
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
         future_to_paper = {
             executor.submit(assess_paper_relevance, paper): paper 
@@ -188,8 +224,12 @@ def main():
             try:
                 paper_with_assessment = future.result()
                 relevant.append(paper_with_assessment)
+                persist_partial()
             except Exception as e:
                 if isinstance(e, CodexError):
+                    for pending in future_to_paper:
+                        if pending is not future:
+                            pending.cancel()
                     raise
                 paper = future_to_paper[future]
                 logging.error(f"Error processing paper {paper['paperId']}: {e}")
@@ -197,6 +237,7 @@ def main():
                 paper_with_assessment['relevance_score'] = 0
                 paper_with_assessment['relevance_rationale'] = f"Processing error: {str(e)}"
                 relevant.append(paper_with_assessment)
+                persist_partial()
     
     print(f"Total LLM cost for contribution_relevance_assessor: ${total_cost:.6f}")
     logging.info(f"{len(relevant)} papers assessed with relevance scores.")
@@ -218,8 +259,8 @@ def main():
         "papers": relevant
     }
     
-    with open(args.output_file, "w") as f:
-        json.dump(output_data, f, indent=2)
+    with open(args.output_file, "w", encoding="utf-8") as f:
+        json.dump(output_data, f, indent=2, ensure_ascii=False)
 if __name__ == "__main__":
     from ScholarEval.utils.checkpoints import checked_main
     checked_main(main, "ScholarEval.contribution.relevance_assessor")

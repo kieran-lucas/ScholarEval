@@ -7,6 +7,8 @@ import subprocess
 from typing import List, Optional, Tuple, Dict, Any
 from urllib.parse import urljoin
 import json
+from pathlib import Path
+from .checkpoints import atomic_json, digest
 
 class FastPDFDownloader:
     def __init__(self, max_workers=80, timeout=8, pdf_dir="pdfs", email=None, log_path=None):
@@ -15,6 +17,17 @@ class FastPDFDownloader:
         self.pdf_dir = pdf_dir
         self.email = email 
         self.unpaywall_base_url = "https://api.unpaywall.org/v2"
+        self.max_attempts = int(os.environ.get('SCHOLAREVAL_PDF_MAX_ATTEMPTS', '1'))
+        if self.max_attempts < 1:
+            raise ValueError('SCHOLAREVAL_PDF_MAX_ATTEMPTS must be >= 1')
+        self.checkpoint_path = Path(pdf_dir) / 'download_progress.json'
+        try:
+            self.download_records = json.loads(self.checkpoint_path.read_text(encoding='utf-8'))
+            if not isinstance(self.download_records, dict):
+                self.download_records = {}
+        except (OSError, ValueError):
+            self.download_records = {}
+        self.active_downloads = {}
 
     def _normalize_pdf_url(self, pdf_url: str) -> str:
         """Quick URL normalization for common cases"""
@@ -76,7 +89,7 @@ class FastPDFDownloader:
 
         try:
             url = f"{self.unpaywall_base_url}/{doi}?email={self.email}"
-            async with session.get(url, ssl=False) as response:
+            async with session.get(url, ssl=True) as response:
                 if response.status == 200:
                     data = await response.json()
                     return data
@@ -169,11 +182,11 @@ class FastPDFDownloader:
 
         strategies = [
             # Strategy 1: Basic download
-            lambda: session.get(pdf_url, ssl=False),
+            lambda: session.get(pdf_url, ssl=True),
             # Strategy 2: With browser headers
             lambda: session.get(
                 pdf_url,
-                ssl=False,
+                ssl=True,
                 headers={
                     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                     "Accept": "application/pdf,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -183,7 +196,7 @@ class FastPDFDownloader:
             # Strategy 3: Allow more redirects
             lambda: session.get(
                 pdf_url,
-                ssl=False,
+                ssl=True,
                 allow_redirects=True,
                 max_redirects=10,
                 headers={"User-Agent": "Mozilla/5.0 (compatible; PDFBot/1.0)"},
@@ -193,15 +206,19 @@ class FastPDFDownloader:
         for i, strategy in enumerate(strategies):
             try:
                 async with strategy() as response:
+                    self._note_download(corpus_id, pdf_url, f'HTTP {response.status}')
+                    self._note_download(corpus_id, str(response.url), f'HTTP {response.status} (final URL)')
                     if response.status == 200:
                         content = await response.read()
                         if self._is_valid_pdf_content(content):
                             with open(pdf_fp, "wb") as f:
                                 f.write(content)
                             return pdf_fp
+                        self._note_download(corpus_id, str(response.url), 'HTTP 200 response is not PDF content')
                     elif response.status == 429:
                         await asyncio.sleep(1)  # Brief pause for rate limiting
-            except Exception:
+            except Exception as error:
+                self._note_download(corpus_id, pdf_url, type(error).__name__)
                 continue
 
         return None
@@ -232,19 +249,22 @@ class FastPDFDownloader:
                     headers=headers,
                     timeout=self.timeout,
                     allow_redirects=True,
-                    verify=False,
+                    verify=True,
                 ),
             )
 
+            self._note_download(corpus_id, pdf_url, f'HTTP {response.status_code}')
+            self._note_download(corpus_id, str(response.url), f'HTTP {response.status_code} (final URL)')
             if response.status_code == 200:
                 content = response.content
                 if self._is_valid_pdf_content(content):
                     with open(pdf_fp, "wb") as f:
                         f.write(content)
                     return pdf_fp
+                self._note_download(corpus_id, str(response.url), 'HTTP 200 response is not PDF content')
 
-        except Exception:
-            pass
+        except Exception as error:
+            self._note_download(corpus_id, pdf_url, type(error).__name__)
 
         return None
 
@@ -255,8 +275,9 @@ class FastPDFDownloader:
         try:
             # Follow DOI redirect quickly
             async with session.get(
-                doi_url, ssl=False, allow_redirects=True
+                doi_url, ssl=True, allow_redirects=True
             ) as response:
+                self._note_download(corpus_id, doi_url, f'HTTP {response.status}')
                 if response.status != 200:
                     return None
 
@@ -283,23 +304,77 @@ class FastPDFDownloader:
                 ]:  # Limit to 2 attempts for speed
                     try:
                         async with session.get(
-                            candidate_url, ssl=False
+                            candidate_url, ssl=True
                         ) as pdf_response:
+                            self._note_download(corpus_id, candidate_url, f'HTTP {pdf_response.status}')
                             if pdf_response.status == 200:
                                 content = await pdf_response.read()
                                 if self._is_valid_pdf_content(content):
                                     with open(pdf_fp, "wb") as f:
                                         f.write(content)
                                     return pdf_fp
-                    except Exception:
-                        continue
+                                self._note_download(corpus_id, str(pdf_response.url), 'HTTP 200 response is not PDF content')
+                    except Exception as error:
+                        self._note_download(corpus_id, candidate_url, type(error).__name__)
 
-        except Exception:
-            pass
+        except Exception as error:
+            self._note_download(corpus_id, doi_url, type(error).__name__)
 
         return None
 
-    async def download_pdf_async(
+    @staticmethod
+    def valid_pdf(path):
+        from PyPDF2 import PdfReader
+        try:
+            return Path(path).is_file() and len(PdfReader(str(path)).pages) > 0
+        except Exception:
+            return False
+
+    def download_record(self, corpus_id, url):
+        return self.download_records.get(digest([str(corpus_id), url]), {})
+
+    def _note_download(self, corpus_id, url, reason):
+        record = self.active_downloads.get(str(corpus_id))
+        if record is not None:
+            record['attempted_urls'] = list(dict.fromkeys([*record['attempted_urls'], url]))
+            record['failures'].append({'url': url, 'reason': reason})
+            atomic_json(self.checkpoint_path, self.download_records)
+
+    async def download_pdf_async(self, session, pdf_url, corpus_id, save_dir=None, try_unpaywall=True):
+        """Reuse valid files; persist a bounded number of complete fallback sequences."""
+        path = Path(save_dir or self.pdf_dir) / f'{corpus_id}.pdf'
+        key = digest([str(corpus_id), pdf_url])
+        record = self.download_records.setdefault(key, {'corpus_id': str(corpus_id), 'url': pdf_url,
+            'attempts': 0, 'attempted_urls': [], 'failures': [], 'status': 'pending'})
+        if self.valid_pdf(path):
+            record['status'] = 'downloaded'
+            atomic_json(self.checkpoint_path, self.download_records)
+            return str(path)
+        self.active_downloads[str(corpus_id)] = record
+        try:
+            while record['attempts'] < self.max_attempts:
+                record['attempts'] += 1
+                record['status'] = 'pending'
+                record['attempted_urls'] = list(dict.fromkeys([*record['attempted_urls'], pdf_url]))
+                atomic_json(self.checkpoint_path, self.download_records)
+                try:
+                    result = await self._download_pdf_attempt_async(session, pdf_url, corpus_id, save_dir, try_unpaywall)
+                except Exception as error:
+                    self._note_download(corpus_id, pdf_url, type(error).__name__)
+                    result = None
+                if result and self.valid_pdf(result):
+                    record['status'] = 'downloaded'
+                    return result
+                if result:
+                    self._note_download(corpus_id, pdf_url, 'Downloaded file is not a readable PDF')
+            record['status'] = 'full_text_unavailable'
+            record['failure_reason'] = 'Bounded download attempts exhausted; no readable PDF'
+            return None
+        finally:
+            atomic_json(self.checkpoint_path, self.download_records)
+            self.active_downloads.pop(str(corpus_id), None)
+
+    async def _download_pdf_attempt_async(
         self,
         session: aiohttp.ClientSession,
         pdf_url: str,
@@ -321,7 +396,12 @@ class FastPDFDownloader:
 
         # Skip if already exists
         if os.path.exists(pdf_fp):
-            return pdf_fp
+            from PyPDF2 import PdfReader
+            try:
+                if len(PdfReader(pdf_fp).pages) > 0:
+                    return pdf_fp
+            except Exception:
+                pass  # Truncated/invalid download must be fetched again.
 
         # Try Unpaywall first if enabled and URL contains a DOI
         if (
@@ -375,7 +455,7 @@ class FastPDFDownloader:
         connector = aiohttp.TCPConnector(
             limit=self.max_workers,
             limit_per_host=8,  # Conservative per host to avoid blocks
-            ssl=False,
+            ssl=True,
             enable_cleanup_closed=True,
             force_close=False,
             keepalive_timeout=30,
@@ -463,23 +543,10 @@ class FastPDFDownloader:
         )
 
     def is_grobid_container_running(self):
-        try:
-            result = subprocess.run(
-                [
-                    "docker",
-                    "ps",
-                    "--filter",
-                    "ancestor=lfoppiano/grobid:latest-crf",
-                    "--format",
-                    "{{.ID}}",
-                ],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            return bool(result.stdout.strip())
-        except subprocess.CalledProcessError:
-            return False
+        from .grobid import GrobidService
+        service = GrobidService()
+        return any(service.compatible(c) and c.get('State', {}).get('Running')
+                   for c in service.containers())
 
     def extract_url(self, text):
         """Extract URL from a given text string using regex."""
@@ -496,7 +563,7 @@ class FastPDFDownloader:
             print("Email required for Unpaywall API")
             return None
 
-        connector = aiohttp.TCPConnector(ssl=False)
+        connector = aiohttp.TCPConnector(ssl=True)
         timeout = aiohttp.ClientTimeout(total=self.timeout)
 
         async with aiohttp.ClientSession(

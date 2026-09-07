@@ -8,6 +8,7 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from litellm import model_cost
 from ..engine.litellm_engine import LLMEngine
+from ..engine.codex_transport import CodexError
 from ..utils.string_utils import StringUtils
 
 def setup_logger():
@@ -176,6 +177,8 @@ def main():
                 "output_tokens": output_tokens
             }
         except Exception as e:
+            if isinstance(e, CodexError):
+                raise
             logging.error(f"Failed comparison for paper '{paper.get('title')}': {e}")
             return {
                 "paper_title": paper.get("title"),
@@ -206,6 +209,8 @@ def main():
                 result = future.result()
                 results.append(result)
             except Exception as e:
+                if isinstance(e, CodexError):
+                    raise
                 paper = future_to_paper[future]
                 logging.error(f"Error processing paper {paper.get('title')}: {e}")
 
@@ -235,4 +240,5 @@ def main():
     logging.info("Done.")
 
 if __name__ == "__main__":
-    main()
+    from ScholarEval.utils.checkpoints import checked_main
+    checked_main(main, "ScholarEval.contribution.pairwise_comparator")

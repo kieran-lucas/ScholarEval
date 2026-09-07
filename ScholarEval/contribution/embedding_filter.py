@@ -154,4 +154,5 @@ def main():
             print(f"{i+1:2d}. {sim:.4f} - {paper['title'][:80]}...")
 
 if __name__ == "__main__":
-    main()
+    from ScholarEval.utils.checkpoints import checked_main
+    checked_main(main, "ScholarEval.contribution.embedding_filter")

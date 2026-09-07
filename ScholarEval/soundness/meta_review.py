@@ -10,8 +10,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from litellm import model_cost
 from ..engine.litellm_engine import LLMEngine
+from ..engine.codex_transport import CodexError
 from ..utils.string_utils import StringUtils
 from ..utils.semantic_scholar import SemanticScholar
+from ..utils.retrieval_http import RetrievalError
 
 def process_reference(rp, method, related_work, rw, llm, su, llm_cost, litellm_name):
     
@@ -124,7 +126,7 @@ def convert_json_to_markdown(analysis_data, output_path):
 
 def save_bibliography(citation_dict, output_path):
     """Save all references used in the meta review to a bibliography text file"""
-    s2 = SemanticScholar(os.environ.get("S2_API_KEY_2"))
+    s2 = SemanticScholar(os.environ.get("S2_API_KEY"))
     
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write("Bibliography - References Used in Meta Review\n")
@@ -174,8 +176,10 @@ def save_bibliography(citation_dict, output_path):
                 f.write(f"   URL: {url}\n")
                 f.write(f"   Corpus ID: {corpus_id}\n\n")
                 time.sleep(1)
+            except RetrievalError:
+                raise
             except Exception as e:
-                # Fallback to original citation format if API call fails
+                # Fallback to original citation format for local formatting failures
                 print(f"Failed to get details for {corpus_id}: {e}")
                 original_citation, original_venue, original_citation_count = citation_dict[corpus_id]
                 
@@ -329,6 +333,8 @@ def main():
                     
             except Exception as e:
                 task = future_to_task[future]
+                if isinstance(e, (CodexError, RetrievalError)):
+                    raise
                 print(f"Error processing {task}: {e}")
     
     print(f"Meta review cost: ${total_cost:.4f} (Input: {total_input_tokens}, Output: {total_output_tokens})")
@@ -356,4 +362,5 @@ def main():
         save_bibliography(citation_dict, args.bibliography_file)
     
 if __name__ == '__main__':
-    main()
+    from ScholarEval.utils.checkpoints import checked_main
+    checked_main(main, "ScholarEval.soundness.meta_review")

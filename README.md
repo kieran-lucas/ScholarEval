@@ -41,6 +41,10 @@ export email="optional - your academic email for unpaywall open access pdfs"
 4. Run `streamlit run ScholarEval/ScholarEval_app.py`
 5. Input your research idea and start the soundness and contribution evaluation as shown in [this short demo video](https://youtu.be/rgLWZkdvUPc). All intermediate logs are saved locally in `demo_data.`
 ##### Run ScholarEval pipeline via command line
+For GPT-6 Astra through official Codex with ChatGPT-managed authentication, see
+[the Codex / Plus backend guide](docs/CODEX_PLUS_BACKEND.md). The existing API
+backend remains the default; retrieval and evaluation methods are unchanged.
+
 Alternatively, if you don't want to use ScholarEval via the user interface, you can simply run the ScholarEval pipeline as follows: 
 
 ```bash
@@ -95,3 +99,8 @@ If you find **ScholarEval** or **ScholarIdeas** useful in your work, please cite
 }
 ```
 
+# Retrieval reliability and resume
+
+Use `--resume` to reuse validated stage checkpoints after infrastructure failures.
+For Semantic Scholar keys/backoff, Docker/GROBID readiness, and commands that debug
+retrieval without any Astra calls, see [the retrieval guide](docs/RETRIEVAL_RELIABILITY.md).

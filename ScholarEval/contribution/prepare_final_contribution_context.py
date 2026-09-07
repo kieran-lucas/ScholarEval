@@ -95,4 +95,5 @@ def main():
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    main()
+    from ScholarEval.utils.checkpoints import checked_main
+    checked_main(main, "ScholarEval.contribution.prepare_final_contribution_context")

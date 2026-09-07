@@ -4,6 +4,7 @@ import argparse
 import pandas as pd
 from litellm import model_cost
 from ..engine.litellm_engine import LLMEngine
+from ..engine.codex_transport import CodexError
 from ..utils.string_utils import StringUtils
 from ..utils.citation_check import check_citations_from_strings
 
@@ -164,6 +165,8 @@ JSON formatting requirements:
             print(f"Citation-checked soundness review saved to {citation_checked_path}")
             
         except Exception as e:
+            if isinstance(e, CodexError):
+                raise
             print(f"Warning: Citation checking failed with error: {e}")
             print("Using original unchecked output as fallback.")
             final_output = md
@@ -177,4 +180,5 @@ JSON formatting requirements:
         f.write(final_output)
 
 if __name__ == '__main__':
-    main()
+    from ScholarEval.utils.checkpoints import checked_main
+    checked_main(main, "ScholarEval.soundness.tldr_soundness")

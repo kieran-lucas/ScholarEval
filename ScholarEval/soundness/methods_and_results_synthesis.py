@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from litellm import model_cost
 from ..engine.litellm_engine import LLMEngine
+from ..engine.codex_transport import CodexError
 from ..utils.string_utils import StringUtils
 
 def process_reference(rp, method, ref, clean_ref_and_paper, llm, su, llm_cost, litellm_name):
@@ -28,7 +29,11 @@ def process_reference(rp, method, ref, clean_ref_and_paper, llm, su, llm_cost, l
     prompt = [
     {
         "role": "user", 
-        "content": """You are an expert research assistant knowledgeable in many domains. You are extremely critical and observant, and do not to overgeneralize findings. You are given a proposed research method and the methods/results section from a paper.
+        "content": """You are an expert research assistant knowledgeable in many domains. You are extremely critical and observant, and do not to overgeneralize findings. You are given a proposed research method and a paper evidence record.
+        Respect evidence_status, download_status and parse_status. For metadata_abstract_only evidence,
+        report only claims supported by the supplied abstract or snippets and identify missing details as unknown.
+        A snippet marked cited_by_source is from another paper citing this candidate, not the candidate's own text.
+        Missing full text or failed parsing is never evidence of no prior art or evidence that a method was not used.
         [start paper]
         {paper_text}
         [end paper]
@@ -79,6 +84,9 @@ def process_reference(rp, method, ref, clean_ref_and_paper, llm, su, llm_cost, l
 
     return {
         'corpus_id': ref,
+        'evidence_status': clean_ref_and_paper[ref].get('evidence_status', 'unknown'),
+        'download_status': clean_ref_and_paper[ref].get('download_status', 'unknown'),
+        'parse_status': clean_ref_and_paper[ref].get('parse_status', 'unknown'),
         'analysis': clean_analysis,
         'cost': cost,
         'input_tokens': input_tokens,
@@ -104,9 +112,9 @@ def main():
     
     with open(args.research_plan, "r", encoding="utf-8") as f:
         rp = f.read()
-    with open(args.methods_and_ref_file) as f:
+    with open(args.methods_and_ref_file, encoding="utf-8") as f:
         clean_methods_refs = json.load(f)
-    with open(args.ref_and_paper_file) as f:
+    with open(args.ref_and_paper_file, encoding="utf-8") as f:
         clean_ref_and_paper = json.load(f)
 
     all_methods_analysis = defaultdict(list)
@@ -156,6 +164,8 @@ def main():
                         total_output_tokens += result.get('output_tokens', 0)
                         
                 except Exception as e:
+                    if isinstance(e, CodexError):
+                        raise
                     task = future_to_task[future]
                     print(f"Error processing {task}: {e}")
         
@@ -180,4 +190,5 @@ def main():
             f.write('\n')
         
 if __name__ == '__main__':
-    main()
+    from ScholarEval.utils.checkpoints import checked_main
+    checked_main(main, "ScholarEval.soundness.methods_and_results_synthesis")

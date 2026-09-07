@@ -96,4 +96,5 @@ def main():
         json.dump({'queries': queries}, f, indent=4)
 
 if __name__ == '__main__':
-    main()
+    from ScholarEval.utils.checkpoints import checked_main
+    checked_main(main, "ScholarEval.soundness.make_queries")

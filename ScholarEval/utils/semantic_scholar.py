@@ -10,6 +10,8 @@ import string
 import numpy as np
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
+from .retrieval_http import RetrievalHTTP
+
 class SemanticScholar(): 
     """
     A class to interact with the Semantic Scholar API.
@@ -21,7 +23,8 @@ class SemanticScholar():
 
         :param api_key: Your Semantic Scholar API key.
         """
-        self.api_key = api_key
+        self.http = RetrievalHTTP(api_key)
+        self.api_key = self.http.api_key
 
     def search_papers(self, query: str):
         """
@@ -46,7 +49,7 @@ class SemanticScholar():
         headers = {"x-api-key": self.api_key}
 
         # Send the API request
-        response = requests.get(url, params=query_params, headers=headers).json()
+        response = self.http.request("GET", url, params=query_params, headers=headers).json()
         return response
 
     def search_top_papers(
@@ -73,8 +76,7 @@ class SemanticScholar():
             params["publicationDateOrYear"] = f":{max_date}"
 
         headers = {"x-api-key": self.api_key}
-        time.sleep(1.2)  # Avoid hitting rate limits
-        response = requests.get(url, params=params, headers=headers, timeout=30)
+        response = self.http.request("GET", url, params=params, headers=headers, timeout=30)
         response.raise_for_status()
         return response.json().get("data", [])
 
@@ -104,9 +106,8 @@ class SemanticScholar():
         if neg_ids:
             payload["negativePaperIds"] = neg_ids
 
-        resp = requests.post(url, params=params, json=payload, headers=headers, timeout=30)
+        resp = self.http.request("POST", url, params=params, json=payload, headers=headers, timeout=30)
         resp.raise_for_status()
-        time.sleep(1)  # Avoid hitting rate limits
         return resp.json().get("recommendedPapers", [])
 
     def get_influential_references(self, paper_id: str) -> List[Dict[str, Any]]:
@@ -119,7 +120,7 @@ class SemanticScholar():
             "limit": 1000
         }
         headers = {"x-api-key": self.api_key}
-        response = requests.get(url, params=params, headers=headers, timeout=30)
+        response = self.http.request("GET", url, params=params, headers=headers, timeout=30)
         response.raise_for_status()
         refs = response.json().get("data", [])
         return [ref["citedPaper"] for ref in refs if ref.get("isInfluential")]
@@ -152,9 +153,9 @@ class SemanticScholar():
             "from": "all-cs"
         }
         headers = {"x-api-key": self.api_key}
-        response = requests.get(url, params=params, headers=headers, timeout=30)
+        response = self.http.request("GET", url, params=params, headers=headers, timeout=30)
         response.raise_for_status()
-        return response.json().get("data", [])  # list of papers
+        return response.json()["recommendedPapers"]  # list of papers
 
     def search_snippets_1(self, 
                        query: str, 
@@ -195,24 +196,8 @@ class SemanticScholar():
         if fields:
             params['fields'] = ','.join(fields)
         
-        try:
-            response = requests.get(
-                url,
-                params=params,
-                headers=headers,
-                timeout=30
-            )
-            
-            response.raise_for_status()
-            return response.json()
-            
-        except requests.exceptions.RequestException as e:
-            print(f"Error making request: {e}")
-            return {}
-        except json.JSONDecodeError as e:
-            print(f"Error parsing JSON response: {e}")
-            return {}
-    
+        return self.http.request("GET", url, params=params, headers=headers, timeout=30).json()
+
     def search_snippets(
         self, 
         query: str, 
@@ -234,13 +219,11 @@ class SemanticScholar():
             Dict containing search results with snippets and paper metadata
         """
         # Prepare query parameters
-        print("preparing params")
         params = {
             'query': query,
             'limit': min(limit, 1000),
         }
-        print("setting year")
-        if year:
+        if (any(year) if isinstance(year, (list, tuple)) else year):
             params['publicationDateOrYear'] = (
                 year[0] + ":" + year[1]
                 if isinstance(year, (list, tuple)) and len(year) == 2 and year[0] and year[1]
@@ -251,34 +234,19 @@ class SemanticScholar():
         if fields:
             params['fields'] = ','.join(fields)
         
-        time.sleep(1.2)
         url = "https://api.semanticscholar.org/graph/v1/snippet/search"
         headers = {
             'User-Agent': 'SemanticScholarSnippetSearch/1.0',
             'x-api-key': self.api_key
         }
-        print(f"Searching snippets with params: {params}")
-        response = requests.get(
+        response = self.http.request("GET",
             url,
             params=params,
             headers=headers,
             timeout=60
         )
-        if response.status_code == 200:
-            print("Successful response from snippet search")
-            return response.json()
-        elif response.status_code == 504:
-            print(f"\nError: {response.status_code} - {response.text}")
-            if rec:
-                print('Already tried to retrieve snippets twice, please try again later.')
-                return None
-            print("Trying again in 10 seconds")
-            time.sleep(10)
-            return self.search_snippets(query, limit=limit, year=year, fields=fields, rec=True)
-        else:
-            print(f"\nError: {response.status_code} - {response.text}")
-            return None
-    
+        return response.json()
+
     def get_references(
         self,
         paper_id: str,
@@ -306,7 +274,7 @@ class SemanticScholar():
                 "limit": limit,
                 "offset": offset
             }
-            resp = requests.get(url, params=params, headers=headers, timeout=30)
+            resp = self.http.request("GET", url, params=params, headers=headers, timeout=30)
             resp.raise_for_status()
             data = resp.json().get("data", [])
 
@@ -324,7 +292,6 @@ class SemanticScholar():
             # Stop if fewer records than requested were returned (last page)
             if len(data) < limit:
                 break
-        time.sleep(1)  # Avoid hitting rate limits
         return references
     def get_paper_details(
         self,
@@ -350,7 +317,7 @@ class SemanticScholar():
         headers = {"x-api-key": self.api_key}
         params = {"fields": fields}
 
-        resp = requests.get(url, params=params, headers=headers, timeout=30)
+        resp = self.http.request("GET", url, params=params, headers=headers, timeout=30)
         resp.raise_for_status()
 
         return resp.json()
@@ -363,8 +330,6 @@ class SemanticScholar():
                 "abstract", "venue", "publicationTypes", "publicationDate"
             ]
         api_key = self.api_key
-        if api_key is None:
-            raise ValueError("API key must be provided either as an argument or set in the environment variable 's2_key'")
         headers = {
             'User-Agent': 'S2Searcher (OSU)',
             'x-api-key': api_key,
@@ -374,8 +339,7 @@ class SemanticScholar():
             'limit': 1,
             'fields': ','.join(fields)
         }
-        time.sleep(1.2)
-        response = requests.get(url, params=params, headers=headers)
+        response = self.http.request("GET", url, params=params, headers=headers)
         return response.json()
     def is_right_paper(self, abs1, abs2):
         """make sure two abstracts are nearly identical"""
@@ -390,6 +354,8 @@ class SemanticScholar():
         return safe_date.strftime('%Y-%m-%d')
     def get_paper_bulk(self, paper_ids, fields=None):
         """Works directly with S2 paper ids"""
+        if not paper_ids:
+            return []
         url = "https://api.semanticscholar.org/graph/v1/paper/batch"
         if not fields:
             fields = [
@@ -407,8 +373,7 @@ class SemanticScholar():
         paper_ids_j = {
             "ids": paper_ids
         }
-        time.sleep(1.2)
-        response = requests.post(url, params=params, headers=headers, json=paper_ids_j)
+        response = self.http.request("POST", url, params=params, headers=headers, json=paper_ids_j)
         return response.json()
 
     def format_authors(self, authors_list):
@@ -429,11 +394,6 @@ class SemanticScholar():
     def get_new_citations(self, paper_ids):
         """Get formatted citations for papers"""
         info = self.get_paper_bulk(paper_ids, fields=['publicationDate', 'authors', 'url', 'venue', 'citationCount'])
-        if len(info) == 0:
-            print('ERROR with get_new_citations:', info)
-            citations = [''] * len(paper_ids)
-            print('S2 rate limit exceeded, filling blank citations')
-            return citations
         citations = []
         for paper in info:
             if paper is None or not paper or not info or isinstance(info[0], str):
@@ -503,7 +463,7 @@ class SemanticScholar():
         all_paper_ids = set()
         for i, _ in enumerate(snippets_data):
             # Add current snippet's paper ID
-            all_paper_ids.add(snippets_data[i]['paper']['corpusId'])
+            all_paper_ids.add(str(snippets_data[i]['paper']['corpusId']))
             # Then add all citations found in the snippet text
             annotations = snippets_data[i]['snippet']['annotations']
             ref_mentions = annotations['refMentions']
@@ -512,7 +472,7 @@ class SemanticScholar():
                 for reference in ref_mentions:
                     cite = reference['matchedPaperCorpusId']
                     if cite:
-                        citations.add(cite)
+                        citations.add(str(cite))
             all_paper_ids.update(citations)
         return all_paper_ids
 
@@ -670,19 +630,9 @@ class SemanticScholar():
         # Count PDFs to be processed
         pdf_files = glob.glob(os.path.join(pdf_dir, "*.pdf"))
         
-        # Call GROBID to process PDFs
-        try:
-            result = client.process(
-                "processFulltextDocument",
-                pdf_dir,
-                n=10  # number of threads
-            )
-        except Exception as e:
-            print(f"GROBID processing failed: {e}")
-            result = None
-        
-        return result
-
+        if not pdf_files:
+            return None
+        return client.process("processFulltextDocument", pdf_dir, n=10)
 
     def is_direct_pdf(self, url):
         """

@@ -5,6 +5,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from litellm import model_cost
 from ..engine.litellm_engine import LLMEngine
+from ..engine.codex_transport import CodexError
 
 def setup_logger():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -22,7 +23,8 @@ def main():
 
     with open(args.research_plan, "r") as f:
         plan = f.read()
-    papers = json.load(open(args.papers_file))
+    with open(args.papers_file, "r", encoding="utf-8") as f:
+        papers = json.load(f)
     
     llm_cost = model_cost[args.litellm_name] if args.litellm_name else None
     
@@ -187,6 +189,8 @@ def main():
                 paper_with_assessment = future.result()
                 relevant.append(paper_with_assessment)
             except Exception as e:
+                if isinstance(e, CodexError):
+                    raise
                 paper = future_to_paper[future]
                 logging.error(f"Error processing paper {paper['paperId']}: {e}")
                 paper_with_assessment = paper.copy()
@@ -217,4 +221,5 @@ def main():
     with open(args.output_file, "w") as f:
         json.dump(output_data, f, indent=2)
 if __name__ == "__main__":
-    main()
+    from ScholarEval.utils.checkpoints import checked_main
+    checked_main(main, "ScholarEval.contribution.relevance_assessor")

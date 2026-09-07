@@ -7,8 +7,12 @@ import os
 import glob
 import subprocess
 import asyncio
+import sys
+from ..utils.checkpoints import StageCheckpoint, digest, atomic_json
+from ..utils.retrieval_progress import RetrievalProgress
 from datetime import datetime
-from grobid_client.grobid_client import GrobidClient
+from ..utils.grobid import GrobidService, GrobidStartupError
+from ..utils.retrieval_http import RetrievalError, RetrievalResponseError
 from ..utils.semantic_scholar import SemanticScholar
 from ..utils.string_utils import GrobidXMLParser
 from ..utils.pdf_utils import FastPDFDownloader
@@ -41,17 +45,14 @@ async def main():
     args = parser.parse_args()
 
     s2 = SemanticScholar(api_key=os.environ.get("S2_API_KEY"))
+    checkpoint = StageCheckpoint('ScholarEval.contribution.paper_augmentation', sys.argv[1:])
+    progress = RetrievalProgress(args.output_file + '.progress.json', checkpoint.fingerprint,
+        s2.http, resume=os.environ.get('SCHOLAREVAL_RESUME') == '1')
+
+    def cached(method, *values, **kwargs):
+        return progress.run(digest([method, values, kwargs]), lambda: getattr(s2, method)(*values, **kwargs))
+
     downloader = FastPDFDownloader()
-    
-    # Start GROBID container if not running
-    if not downloader.is_grobid_container_running():
-        logging.info("Starting GROBID container...")
-        subprocess.run(["docker", "run", "-d", "--rm", "-p", "8070:8070", "lfoppiano/grobid:latest-crf"])
-        while not downloader.is_grobid_container_running():
-            logging.info("Waiting for GROBID container to start...")
-            time.sleep(5)
-    else:
-        logging.info("GROBID container is already running.")
     
     papers_data = json.load(open(args.relevant_papers))
     papers = papers_data['papers'] if 'papers' in papers_data else papers_data
@@ -78,19 +79,21 @@ async def main():
         logging.info(f" → Fetching recommendations (limit={args.rec_limit})")
         recommendations_for_this_paper = 0
         try:
-            recs = s2.get_recommendations_multi_seed([pid], limit=args.rec_limit)
+            recs = cached('get_recommendations_multi_seed', [pid], limit=args.rec_limit)
             for r in recs:
                 rid = r['paperId']
                 logging.info(f"    • Recommendation: {rid}")
                 if rid not in augmented:
-                    paper_details = s2.get_paper_details(rid)
+                    paper_details = cached('get_paper_details', rid)
                     if (is_date_after(args.cutoff_date, paper_details.get('publicationDate', '')) if args.cutoff_date else True):
                         augmented[rid] = paper_details
                         recommendations_added += 1
                         recommendations_for_this_paper += 1
             logging.info(f"   Added {recommendations_for_this_paper} new recommendations for {pid}")
-        except Exception as e:
-            logging.warning(f"Failed to fetch recommendations for {pid}: {e}")
+        except (RetrievalError, GrobidStartupError):
+            raise
+        except Exception:
+            raise RetrievalResponseError("Contribution retrieval/PDF processing failed; output is incomplete") from None
         time.sleep(args.sleep_between_calls)
 
         if args.augmentation_type == "related_work":
@@ -102,7 +105,7 @@ async def main():
         try:
             if args.augmentation_type == "related_work":
                 # Get paper metadata to find PDF
-                paper_details = s2.get_paper_details(pid)
+                paper_details = cached('get_paper_details', pid)
                 pdf_url = None
                 
                 if paper_details.get('openAccessPdf'):
@@ -121,8 +124,7 @@ async def main():
                 pdf_path = await download_single_pdf(downloader, pdf_url, corpus_id, args.pdf_dir)
                 
                 if not pdf_path:
-                    logging.warning(f"Failed to download PDF for {pid}")
-                    continue
+                    raise RetrievalError(f"Failed to download PDF for {pid}; augmentation incomplete")
                     
                 # Process with GROBID (defer to batch processing after all downloads)
                 pdfs_downloaded += 1
@@ -130,7 +132,7 @@ async def main():
                 
             else:  # augmentation_type == "all"
                 # Use simple references API (from old code)
-                refs = s2.get_references(pid, max_references=args.max_refs_per_paper)
+                refs = cached('get_references', pid, max_references=args.max_refs_per_paper)
                 references_for_this_paper = 0
                 for cited in refs:
                     cid = cited.get("paperId")
@@ -138,17 +140,16 @@ async def main():
                         continue
                     logging.info(f"    • Reference: {cid}")
                     if cid not in augmented:
-                        details = s2.get_paper_details(cid)
+                        details = cached('get_paper_details', cid)
                         augmented[cid] = details
                         references_added += 1
                         references_for_this_paper += 1
                 logging.info(f"   Added {references_for_this_paper} new references for {pid}")
                 
-        except Exception as e:
-            if args.augmentation_type == "related_work":
-                logging.warning(f"Failed to process related work for {pid}: {e}")
-            else:
-                logging.warning(f"Failed to fetch references for {pid}: {e}")
+        except (RetrievalError, GrobidStartupError):
+            raise
+        except Exception:
+            raise RetrievalResponseError("Contribution retrieval/PDF processing failed; output is incomplete") from None
         
         time.sleep(args.sleep_between_calls)
 
@@ -156,11 +157,9 @@ async def main():
     if args.augmentation_type == "related_work" and pdfs_downloaded > 0:
         logging.info(f"Processing {pdfs_downloaded} downloaded PDFs with GROBID...")
         try:
+            progress.state['metrics'].update(GrobidService(args.grobid_config).ensure_ready())
+            from grobid_client.grobid_client import GrobidClient
             client = GrobidClient(config_path=args.grobid_config)
-            # Wait for GROBID to be ready
-            while not is_grobid_ready():
-                logging.info("Waiting for GROBID server to be ready...")
-                time.sleep(5)
             
             # Process all PDFs in the directory
             result = s2.extract_sections_from_pdf(client, args.pdf_dir)
@@ -199,21 +198,30 @@ async def main():
                                 
                         logging.info(f"   Found {len(related_work_refs)} total references, added {new_papers_from_this_xml} new papers from {corpus_id}")
                         
-                    except Exception as e:
-                        logging.warning(f"Failed to extract related work from {xml_path}: {e}")
+                    except (RetrievalError, GrobidStartupError):
+                        raise
+                    except Exception:
+                        raise RetrievalResponseError("Contribution retrieval/PDF processing failed; output is incomplete") from None
                 else:
-                    logging.warning(f"XML file not found for {pdf_path}")
+                    raise RetrievalError(f"XML file not found for {pdf_path}; augmentation incomplete")
             
             logging.info(f"Processed {xml_files_processed} XML files out of {len(pdf_files)} PDFs")
             
-        except Exception as e:
-            logging.error(f"GROBID batch processing failed: {e}")
+        except (RetrievalError, GrobidStartupError):
+            raise
+        except Exception:
+            raise RetrievalResponseError("Contribution retrieval/PDF processing failed; output is incomplete") from None
     else:
         if args.augmentation_type == "related_work":
             logging.info("No PDFs downloaded for related work extraction")
         else:
             logging.info("Skipping GROBID processing for 'all' augmentation type")
 
+    progress.state['status'] = 'completed'
+    progress.state['metrics'].update(pdfs_downloaded=pdfs_downloaded, pdfs_parsed=xml_files_processed,
+                                     unique_papers_found=len(augmented))
+    progress.save()
+    atomic_json(args.output_file + '.metrics.json', {'retrieval': progress.state['metrics']})
     # Save augmented results
     out = list(augmented.values())
     final_paper_count = len(out)
@@ -237,7 +245,7 @@ async def main():
         total_added = recommendations_added + references_added
     logging.info(f"Total papers added: {total_added}")
     logging.info(f"Final paper count: {final_paper_count}")
-    logging.info(f"Growth factor: {final_paper_count/initial_paper_count:.2f}x")
+    logging.info(f"Growth factor: {final_paper_count/max(initial_paper_count, 1):.2f}x")
     logging.info("=" * 60)
     logging.info(f"Saved {final_paper_count} papers to {args.output_file}")
 
@@ -248,21 +256,13 @@ async def download_single_pdf(downloader, pdf_url, corpus_id, pdf_dir):
         pdf_data = [(pdf_url, corpus_id)]
         results = await downloader.download_pdfs_batch_async(pdf_data, save_dir=pdf_dir)
         
-        if results and len(results) > 0:
+        if results and results[0] and not isinstance(results[0], Exception):
             return os.path.join(pdf_dir, f"{corpus_id}.pdf")
         return None
-    except Exception as e:
-        logging.error(f"Error downloading PDF {corpus_id}: {e}")
-        return None
-
-def is_grobid_ready():
-    """Check if GROBID server is ready."""
-    try:
-        import requests
-        response = requests.get("http://localhost:8070/api/isalive", timeout=5)
-        return response.status_code == 200
-    except:
-        return False
+    except (RetrievalError, GrobidStartupError):
+        raise
+    except Exception:
+        raise RetrievalResponseError("Contribution retrieval/PDF processing failed; output is incomplete") from None
 
 def extract_related_work_references(xml_path, s2_client):
     """Extract papers referenced in the related work section."""
@@ -346,9 +346,10 @@ def extract_related_work_references(xml_path, s2_client):
                 else:
                     logging.info(f"     ✗ No search results from Semantic Scholar")
                     
-            except Exception as e:
-                logging.warning(f"     Error searching for paper '{title[:30]}...': {e}")
-                continue
+            except (RetrievalError, GrobidStartupError):
+                raise
+            except Exception:
+                raise RetrievalResponseError("Contribution retrieval/PDF processing failed; output is incomplete") from None
             
             # Rate limiting
             time.sleep(1)
@@ -357,9 +358,10 @@ def extract_related_work_references(xml_path, s2_client):
         
         return found_papers
         
-    except Exception as e:
-        logging.error(f"Error extracting related work references: {e}")
-        return []
+    except (RetrievalError, GrobidStartupError):
+        raise
+    except Exception:
+        raise RetrievalResponseError("Contribution retrieval/PDF processing failed; output is incomplete") from None
 
 def find_best_title_match(target_title, search_results):
     """Find the best matching paper based on title similarity."""
@@ -393,4 +395,5 @@ def find_best_title_match(target_title, search_results):
     return best_match
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    from ScholarEval.utils.checkpoints import checked_main
+    checked_main(lambda: asyncio.run(main()), "ScholarEval.contribution.paper_augmentation")

@@ -4,6 +4,7 @@ import logging
 import os
 from litellm import model_cost
 from ..engine.litellm_engine import LLMEngine
+from ..engine.codex_transport import CodexError
 from ..utils.citation_check import check_citations_from_strings
 
 def setup_logger():
@@ -203,6 +204,8 @@ def main():
         logging.info("Citation-checked contribution evaluation saved to %s", citation_checked_path)
         
     except Exception as e:
+        if isinstance(e, CodexError):
+            raise
         logging.warning(f"Citation checking failed with error: {e}")
         logging.info("Using original unchecked output as fallback.")
         final_output = full_output
@@ -213,4 +216,5 @@ def main():
     logging.info("Final contribution assessment saved to %s", args.output_file)
 
 if __name__ == "__main__":
-    main()
+    from ScholarEval.utils.checkpoints import checked_main
+    checked_main(main, "ScholarEval.contribution.contribution_review_synthesis")

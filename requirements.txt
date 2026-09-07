@@ -6,4 +6,9 @@ tavily-python
 tqdm
 PyPDF2
 grobid-client-python
+aiohttp
+numpy
+python-dateutil
+pandas
+jsonschema
 

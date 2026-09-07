@@ -66,4 +66,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from ScholarEval.utils.checkpoints import checked_main
+    checked_main(main, "ScholarEval.contribution.paper_sampler")

@@ -77,4 +77,5 @@ def main():
         json.dump({'clean_methods': clean_methods}, f, indent=4)
 
 if __name__ == '__main__':
-    main()
+    from ScholarEval.utils.checkpoints import checked_main
+    checked_main(main, "ScholarEval.soundness.extract_methods")

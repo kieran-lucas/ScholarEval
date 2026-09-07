@@ -5,7 +5,9 @@ import subprocess
 import json
 from pathlib import Path
 import time
+import threading
 import PyPDF2
+from ScholarEval.engine.codex_session import CodexRun
 
 def ensure_demo_data_dir():
     """Create and return the demo_data directory path."""
@@ -18,7 +20,11 @@ def monitor_progress_with_details(process, progress_file, status_placeholder, pr
     last_progress = base_progress
     progress_info_container = st.empty()  # For progress info
     
-    while process.poll() is None:
+    def drain():
+        process._captured_output = process.communicate()
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    while reader.is_alive():
         time.sleep(1)
         if progress_file.exists():
             try:
@@ -102,14 +108,21 @@ st.set_page_config(
 st.title("🔍 ScholarEval: Research Idea Evaluator Grounded in Literature")
 
 st.sidebar.header("Configuration")
+codex_backend = os.environ.get('SCHOLAREVAL_LLM_BACKEND', 'litellm').lower() == 'codex'
 llm_model = st.sidebar.selectbox(
     "Select LLM Model",
     ["GPT-4.1", "GPT-4o", "GPT-4.1-mini", "GPT-4.1-nano", "Anthropic Claude 4 Sonnet", "Anthropic Claude 3.5 Haiku"],
-    index=0
+    index=0,
+    disabled=codex_backend
 )
+if codex_backend:
+    st.sidebar.info('Codex: GPT-6 Astra requested; access is checked at startup. Reasoning: ' + os.environ.get('SCHOLAREVAL_CODEX_REASONING', 'high'))
 
 api_keys_status = st.sidebar.expander("API Keys Status")
 required_keys = ["API_KEY", "S2_API_KEY"]
+if codex_backend:
+    required_keys = ['S2_API_KEY']
+    api_keys_status.write('API_KEY/API_ENDPOINT remain separate requirements for Titan embedding retrieval.')
 for key in required_keys:
     status = "✅" if os.environ.get(key) else "❌"
     api_keys_status.write(f"{key}: {status}")
@@ -124,6 +137,7 @@ litellm_name = None
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### Runs Storage")
+resume_directory = st.sidebar.text_input('Resume stage directory (optional)', help='Directory containing saved methods/queries or contribution artifacts; validated against the current idea.')
 demo_data_path = Path("demo_data")
 if demo_data_path.exists():
     demo_folders = [f for f in demo_data_path.iterdir() if f.is_dir()]
@@ -199,6 +213,7 @@ with col2:
     with tabs[0]:
         st.subheader("Soundness Review")
         if st.button("Generate Soundness Review", disabled=not can_generate, key="soundness_btn"):
+            codex_run = None
             st.info("Running soundness review pipeline...")
             
             try:
@@ -206,22 +221,28 @@ with col2:
                 
                 # Create demo_data directory for persistent storage
                 demo_data_path = ensure_demo_data_dir()
-                soundness_dir = demo_data_path / f"soundness_{int(time.time())}"
+                soundness_dir = Path(resume_directory) if resume_directory else demo_data_path / f"soundness_{int(time.time())}"
                 soundness_dir.mkdir(exist_ok=True)
+                if codex_backend:
+                    codex_run = CodexRun(cache_path=os.environ.get('SCHOLAREVAL_CODEX_CACHE') or str(soundness_dir / 'codex-responses.sqlite3'))
                 
                 input_file = soundness_dir / "research_plan.txt"
-                with open(input_file, 'w') as f:
+                with open(input_file, 'w', encoding='utf-8') as f:
                     f.write(research_plan_text)
                 
                 st.info(f"Saving intermediate results to: `{soundness_dir}`")
                 
                 # Set up environment - always run from root directory where packages are installed
                 env = os.environ.copy()
+                env['SCHOLAREVAL_RESUME'] = '1' if resume_directory else '0'
+                env['PYTHONIOENCODING'] = 'utf-8'
                 # Add current directory to Python path for local imports
                 import sys
                 working_dir = "."  # Always use root directory
-                current_python_path = ":".join(sys.path)
-                env["PYTHONPATH"] = f"{os.path.abspath('.')}:{current_python_path}:{env.get('PYTHONPATH', '')}"
+                env['PYTHONPATH'] = os.pathsep.join([os.path.abspath('.'), *sys.path, env.get('PYTHONPATH', '')])
+                env['PATH'] = str(Path(sys.executable).parent) + os.pathsep + env.get('PATH', '')
+                if codex_run:
+                    env.update(codex_run.environment())
 
                 # Pipeline steps
                 status_placeholder = st.empty()
@@ -234,7 +255,7 @@ with col2:
                 cmd1 = ["python", "-m", "ScholarEval.soundness.extract_methods", "--input_file", str(input_file), "--output_file", str(soundness_dir / "methods.json"), "--llm_engine_name", "GPT-4.1-nano", "--cost_log_file", str(soundness_dir / "soundness_costs.jsonl")]
                 if litellm_name:
                     cmd1.extend(["--litellm_name", litellm_name])
-                result = subprocess.run(cmd1, capture_output=True, text=True, cwd=working_dir, env=env)
+                result = subprocess.run(cmd1, capture_output=True, text=True, encoding='utf-8', cwd=working_dir, env=env)
                 if result.returncode != 0:
                     st.error(f"Method extraction failed: {result.stderr}")
                     st.stop()
@@ -255,7 +276,7 @@ with col2:
                 cmd3 = ["python", "-m", "ScholarEval.soundness.make_queries", "--research_plan", str(input_file), "--methods_file", str(soundness_dir / "methods.json"), "--output_file", str(soundness_dir / "queries.json"), "--llm_engine_name", "GPT-4.1-nano", "--cost_log_file", str(soundness_dir / "soundness_costs.jsonl")]
                 if litellm_name:
                     cmd3.extend(["--litellm_name", litellm_name])
-                result = subprocess.run(cmd3, capture_output=True, text=True, cwd=working_dir, env=env)
+                result = subprocess.run(cmd3, capture_output=True, text=True, encoding='utf-8', cwd=working_dir, env=env)
                 if result.returncode != 0:
                     st.error(f"Query generation failed: {result.stderr}")
                     st.stop()
@@ -281,13 +302,13 @@ with col2:
                     cmd4.extend(["--cutoff_date", str(cutoff_date)])
                 
                 # Start the subprocess for snippet search
-                process = subprocess.Popen(cmd4, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=working_dir, env=env)
+                process = subprocess.Popen(cmd4, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', cwd=working_dir, env=env)
                 
                 # Monitor progress with detailed updates
                 final_progress = monitor_progress_with_details(process, progress_file, status_placeholder, progress_bar, 50, 20)
                 
                 # Wait for completion and check result
-                stdout, stderr = process.communicate()
+                stdout, stderr = process._captured_output
                 if process.returncode != 0:
                     st.error(f"Snippet search failed: {stderr}")
                     st.stop()
@@ -302,7 +323,7 @@ with col2:
                 cmd5 = ["python", "-m", "ScholarEval.soundness.methods_and_results_synthesis", "--research_plan", str(input_file), "--methods_and_ref_file", str(soundness_dir / "snippet_references.json"), "--ref_and_paper_file", str(soundness_dir / "snippet_papers.json"), "--output_file", str(soundness_dir / "methods_analysis.json"), "--llm_engine_name", llm_model, "--cost_log_file", str(soundness_dir / "soundness_costs.jsonl")]
                 if litellm_name:
                     cmd5.extend(["--litellm_name", litellm_name])
-                result = subprocess.run(cmd5, capture_output=True, text=True, cwd=working_dir, env=env)
+                result = subprocess.run(cmd5, capture_output=True, text=True, encoding='utf-8', cwd=working_dir, env=env)
                 if result.returncode != 0:
                     st.error(f"Method analysis failed: {result.stderr}")
                     st.stop()
@@ -316,7 +337,7 @@ with col2:
                 cmd6 = ["python", "-m", "ScholarEval.soundness.meta_review", "--research_plan", str(input_file), "--mr_analysis_file", str(soundness_dir / "methods_analysis.json"), "--methods_and_ref_file", str(soundness_dir / "snippet_references.json"), "--output_file", str(review_file), "--markdown_output", str(soundness_dir / "meta_review.md"), "--llm_engine_name", llm_model, "--cost_log_file", str(soundness_dir / "soundness_costs.jsonl")]
                 if litellm_name:
                     cmd6.extend(["--litellm_name", litellm_name])
-                result = subprocess.run(cmd6, capture_output=True, text=True, cwd=working_dir, env=env)
+                result = subprocess.run(cmd6, capture_output=True, text=True, encoding='utf-8', cwd=working_dir, env=env)
                 if result.returncode != 0:
                     st.error(f"Meta review failed: {result.stderr}")
                     st.stop()
@@ -331,7 +352,7 @@ with col2:
                 "--markdown_file",str(soundness_dir / "tldr_soundness.md"), "--cost_log_file", str(soundness_dir / "soundness_costs.jsonl")]
                 if litellm_name:
                     cmd7.extend(["--litellm_name", litellm_name])
-                result = subprocess.run(cmd7, capture_output=True, text=True, cwd=working_dir, env=env)
+                result = subprocess.run(cmd7, capture_output=True, text=True, encoding='utf-8', cwd=working_dir, env=env)
                 if result.returncode != 0:
                     st.error(f"TLDR failed: {result.stderr}")
                     st.stop()
@@ -374,9 +395,13 @@ with col2:
 
             except Exception as e:
                 st.error(f"Soundness review failed: {e}")
+            finally:
+                if codex_run:
+                    codex_run.close()
     with tabs[1]:
         st.subheader("Contribution Review")
         if st.button("Generate Contribution Review", disabled=not can_generate, key="contribution_btn"):
+            codex_run = None
             st.info("Running contribution review pipeline...")
             
             try:
@@ -384,22 +409,28 @@ with col2:
                 
                 # Create demo_data directory for persistent storage
                 demo_data_path = ensure_demo_data_dir()
-                contribution_dir = demo_data_path / f"contribution_{int(time.time())}"
+                contribution_dir = Path(resume_directory) if resume_directory else demo_data_path / f"contribution_{int(time.time())}"
                 contribution_dir.mkdir(exist_ok=True)
+                if codex_backend:
+                    codex_run = CodexRun(cache_path=os.environ.get('SCHOLAREVAL_CODEX_CACHE') or str(contribution_dir / 'codex-responses.sqlite3'))
                 
                 input_file = contribution_dir / "research_plan.txt"
-                with open(input_file, 'w') as f:
+                with open(input_file, 'w', encoding='utf-8') as f:
                     f.write(research_plan_text)
                 
                 st.info(f"Saving intermediate results to: `{contribution_dir}`")
                 
                 # Set up environment - always run from root directory where packages are installed
                 env = os.environ.copy()
+                env['SCHOLAREVAL_RESUME'] = '1' if resume_directory else '0'
+                env['PYTHONIOENCODING'] = 'utf-8'
                 # Add current directory to Python path for local imports
                 import sys
                 working_dir = "."  # Always use root directory
-                current_python_path = ":".join(sys.path)
-                env["PYTHONPATH"] = f"{os.path.abspath('.')}:{current_python_path}:{env.get('PYTHONPATH', '')}"
+                env['PYTHONPATH'] = os.pathsep.join([os.path.abspath('.'), *sys.path, env.get('PYTHONPATH', '')])
+                env['PATH'] = str(Path(sys.executable).parent) + os.pathsep + env.get('PATH', '')
+                if codex_run:
+                    env.update(codex_run.environment())
 
                 # Example pipeline steps
                 status_placeholder = st.empty()
@@ -412,7 +443,7 @@ with col2:
                 cmd1 = ["python", "-m", "ScholarEval.contribution.extract_dimensions_and_contributions", "--input_file", str(input_file), "--llm_engine", "GPT-4.1-nano", "--output_file", str(contribution_dir / "dimensions_contributions.jsonl"), "--cost_log_file", str(contribution_dir / "contribution_costs.jsonl")]
                 if litellm_name:
                     cmd1.extend(["--litellm_name", litellm_name])
-                result = subprocess.run(cmd1, capture_output=True, text=True, cwd=working_dir, env=env)
+                result = subprocess.run(cmd1, capture_output=True, text=True, encoding='utf-8', cwd=working_dir, env=env)
                 if result.returncode != 0:
                     st.error(f"Dimension extraction failed: {result.stderr}")
                     st.stop()
@@ -436,7 +467,7 @@ with col2:
                 cmd2 = ["python", "-m", "ScholarEval.contribution.queries_generator", "--research_plan", str(input_file), "--contrib_file", str(contribution_dir / "dimensions_contributions.jsonl"), "--llm_engine_name", "GPT-4.1-nano", "--output_file", str(contribution_dir / "contribution_queries.json"), "--cost_log_file", str(contribution_dir / "contribution_costs.jsonl")]
                 if litellm_name:
                     cmd2.extend(["--litellm_name", litellm_name])
-                result = subprocess.run(cmd2, capture_output=True, text=True, cwd=working_dir, env=env)
+                result = subprocess.run(cmd2, capture_output=True, text=True, encoding='utf-8', cwd=working_dir, env=env)
                 if result.returncode != 0:
                     st.error(f"Query generation failed: {result.stderr}")
                     st.stop()
@@ -462,13 +493,13 @@ with col2:
                     cmd3.extend(["--cutoff_date", str(cutoff_date)])
                 
                 # Start the subprocess for paper extraction
-                process = subprocess.Popen(cmd3, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=working_dir, env=env)
+                process = subprocess.Popen(cmd3, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', cwd=working_dir, env=env)
                 
                 # Monitor progress
                 final_progress = monitor_progress_with_details(process, progress_file, status_placeholder, progress_bar, 25, 20)
                 
                 # Wait for completion and check result
-                stdout, stderr = process.communicate()
+                stdout, stderr = process._captured_output
                 if process.returncode != 0:
                     st.error(f"Paper extraction failed: {stderr}")
                     st.stop()
@@ -492,7 +523,7 @@ with col2:
                 cmd4 = ["python", "-m", "ScholarEval.contribution.relevance_assessor", "--research_plan", str(input_file), "--papers_file", str(contribution_dir / "contribution_papers.json"), "--llm_engine", llm_model, "--output_file", str(contribution_dir / "filtered_contribution_papers.json"), "--cost_log_file", str(contribution_dir / "contribution_costs.jsonl")]
                 if litellm_name:
                     cmd4.extend(["--litellm_name", litellm_name])
-                result = subprocess.run(cmd4, capture_output=True, text=True, cwd=working_dir, env=env)
+                result = subprocess.run(cmd4, capture_output=True, text=True, encoding='utf-8', cwd=working_dir, env=env)
                 if result.returncode != 0:
                     st.error(f"Relevance assessment failed: {result.stderr}")
                     st.stop()
@@ -516,7 +547,7 @@ with col2:
                 cmd5 = ["python", "-m", "ScholarEval.contribution.paper_augmentation", "--relevant_papers", str(contribution_dir / "filtered_contribution_papers.json"), "--output_file", str(contribution_dir / "augmented_contribution_papers.json")]
                 if cutoff_date:
                     cmd5.extend(["--cutoff_date", str(cutoff_date)])
-                result = subprocess.run(cmd5, capture_output=True, text=True, cwd=working_dir, env=env)
+                result = subprocess.run(cmd5, capture_output=True, text=True, encoding='utf-8', cwd=working_dir, env=env)
                 if result.returncode != 0:
                     st.error(f"Paper augmentation failed: {result.stderr}")
                     st.stop()
@@ -535,7 +566,7 @@ with col2:
                 progress_bar.progress(70)
                 st.info("Applying embedding-based filtering...")
                 cmd6 = ["python", "-m", "ScholarEval.contribution.embedding_filter", "--research_plan", str(input_file), "--papers_json", str(contribution_dir / "augmented_contribution_papers.json"), "--output", str(contribution_dir / "filtered_augmented_contribution_papers.json"), "--top_k", "100"]
-                result = subprocess.run(cmd6, capture_output=True, text=True, cwd=working_dir, env=env)
+                result = subprocess.run(cmd6, capture_output=True, text=True, encoding='utf-8', cwd=working_dir, env=env)
                 if result.returncode != 0:
                     st.error(f"Embedding filter failed: {result.stderr}")
                     st.stop()
@@ -548,7 +579,7 @@ with col2:
                 cmd7 = ["python", "-m", "ScholarEval.contribution.relevance_assessor", "--research_plan", str(input_file), "--papers_file", str(contribution_dir / "filtered_augmented_contribution_papers.json"), "--llm_engine", llm_model, "--output_file", str(contribution_dir / "final_contribution_papers.json"), "--cost_log_file", str(contribution_dir / "contribution_costs.jsonl")]
                 if litellm_name:
                     cmd7.extend(["--litellm_name", litellm_name])
-                result = subprocess.run(cmd7, capture_output=True, text=True, cwd=working_dir, env=env)
+                result = subprocess.run(cmd7, capture_output=True, text=True, encoding='utf-8', cwd=working_dir, env=env)
                 if result.returncode != 0:
                     st.error(f"Final relevance assessment failed: {result.stderr}")
                     st.stop()
@@ -568,7 +599,7 @@ with col2:
                 progress_bar.progress(80)
                 st.info("Downsampling papers for comparison...")
                 cmd8 = ["python", "-m", "ScholarEval.contribution.paper_sampler", "--input_file", str(contribution_dir / "final_contribution_papers.json"), "--output_file", str(contribution_dir / "sampled_final_contribution_papers.json")]
-                result = subprocess.run(cmd8, capture_output=True, text=True, cwd=working_dir, env=env)
+                result = subprocess.run(cmd8, capture_output=True, text=True, encoding='utf-8', cwd=working_dir, env=env)
                 if result.returncode != 0:
                     st.error(f"Downsampling failed: {result.stderr}")
                     st.stop()
@@ -581,7 +612,7 @@ with col2:
                 cmd9 = ["python", "-m", "ScholarEval.contribution.pairwise_comparator", "--research_plan", str(input_file), "--papers_metadata", str(contribution_dir / "sampled_final_contribution_papers.json"), "--dimensions_file", str(contribution_dir / "dimensions_contributions.jsonl"), "--llm_engine", llm_model, "--output_file", str(contribution_dir / "pairwise_comparisons.json"), "--cost_log_file", str(contribution_dir / "contribution_costs.jsonl")]
                 if litellm_name:
                     cmd9.extend(["--litellm_name", litellm_name])
-                result = subprocess.run(cmd9, capture_output=True, text=True, cwd=working_dir, env=env)
+                result = subprocess.run(cmd9, capture_output=True, text=True, encoding='utf-8', cwd=working_dir, env=env)
                 if result.returncode != 0:
                     st.error(f"Pairwise comparison failed: {result.stderr}")
                     st.stop()
@@ -592,7 +623,7 @@ with col2:
                 progress_bar.progress(90)
                 st.info("Preparing context for final evaluation...")
                 cmd10 = ["python", "-m", "ScholarEval.contribution.prepare_final_contribution_context", "--input_file", str(contribution_dir / "pairwise_comparisons.json"), "--output_file", str(contribution_dir / "contribution_context.json")]
-                result = subprocess.run(cmd10, capture_output=True, text=True, cwd=working_dir, env=env)
+                result = subprocess.run(cmd10, capture_output=True, text=True, encoding='utf-8', cwd=working_dir, env=env)
                 if result.returncode != 0:
                     st.error(f"Context preparation failed: {result.stderr}")
                     st.stop()
@@ -607,7 +638,7 @@ with col2:
                 cmd11 = ["python", "-m", "ScholarEval.contribution.contribution_review_synthesis", "--research_plan", str(input_file), "--comparisons_file", str(contribution_dir / "contribution_context.json"), "--llm_engine", llm_model, "--output_file", str(review_file), "--cost_log_file", str(contribution_dir / "contribution_costs.jsonl")]
                 if litellm_name:
                     cmd11.extend(["--litellm_name", litellm_name])
-                result = subprocess.run(cmd11, capture_output=True, text=True, cwd=working_dir, env=env)
+                result = subprocess.run(cmd11, capture_output=True, text=True, encoding='utf-8', cwd=working_dir, env=env)
                 if result.returncode != 0:
                     st.error(f"Contribution review synthesis failed: {result.stderr}")
                     st.stop()
@@ -639,4 +670,6 @@ with col2:
                 )
 
             except Exception as e:
-                st.error(f"Contribution review failed: {e}")
+                st.error(f"Contribution review failed: {e}")            finally:
+                if codex_run:
+                    codex_run.close()

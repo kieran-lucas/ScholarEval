@@ -121,4 +121,5 @@ def main():
     print(f"Generated queries for {len(contributions)} contributions; output saved to {args.output_file}")
 
 if __name__ == "__main__":
-    main()
+    from ScholarEval.utils.checkpoints import checked_main
+    checked_main(main, "ScholarEval.contribution.queries_generator")

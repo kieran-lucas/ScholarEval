@@ -1,0 +1,11 @@
+TopoDrift-LoRA: Persistent-Homology-Guided Dynamic Rank Allocation for Parameter-Efficient Fine-Tuning
+
+We propose a dynamic LoRA rank-allocation method in which a fixed global adapter-rank budget is redistributed across Transformer layers according to topological changes in their hidden-state activation manifolds during fine-tuning.
+
+At fixed training intervals, a small fixed probe set is passed through the model. For each adapted layer, hidden states form a point cloud, from which H0 and H1 persistence diagrams are computed. The Wasserstein distance between the current and previous persistence diagrams defines a layer-wise topological-drift signal.
+
+An exponentially smoothed version of this signal is used to redistribute the fixed global LoRA rank budget: layers whose representation topology is still reorganizing receive additional rank, whereas layers whose topology has stabilized surrender rank. Rank changes use minimum-rank constraints and hysteresis to prevent oscillation.
+
+Unlike existing adaptive-rank methods based primarily on gradients, Fisher information, parameter importance, or singular values, the proposed allocator uses changes in representation-space topology as the capacity-demand signal.
+
+We hypothesize that this provides a task-level measure of where adaptation capacity is still needed and can improve the performance-parameter-training-cost trade-off and out-of-domain generalization relative to fixed-rank LoRA and existing adaptive-rank methods.

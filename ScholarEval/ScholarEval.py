@@ -5,12 +5,16 @@ import argparse
 import subprocess
 import time
 from pathlib import Path
+from ScholarEval.engine.codex_session import run_environment, close_run
+from ScholarEval.engine.codex_transport import CodexError
 
 
 def run_command(cmd, working_dir=".", env=None):
     """Execute a command and return the result."""
+    if cmd[0] == 'python':
+        cmd = [sys.executable, *cmd[1:]]
     print(f"Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=working_dir, env=env)
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', cwd=working_dir, env=env)
     
     if result.returncode != 0:
         print(f"Command failed with return code {result.returncode}")
@@ -18,6 +22,10 @@ def run_command(cmd, working_dir=".", env=None):
         print(f"STDOUT: {result.stdout}")
         return False
     
+    if result.stdout:
+        print(result.stdout.rstrip())
+    if result.stderr:
+        print(result.stderr.rstrip(), file=sys.stderr)
     print("Command completed successfully")
     return True
 
@@ -25,12 +33,14 @@ def run_command(cmd, working_dir=".", env=None):
 def setup_environment():
     """Set up the environment for running the pipeline."""
     env = os.environ.copy()
-    current_python_path = ":".join(sys.path)
-    env["PYTHONPATH"] = f"{os.path.abspath('.')}:{current_python_path}:{env.get('PYTHONPATH', '')}"
+    env["PYTHONPATH"] = os.pathsep.join([os.path.abspath('.'), *sys.path, env.get('PYTHONPATH', '')])
+    env['PYTHONIOENCODING'] = 'utf-8'
+    if env.get('SCHOLAREVAL_NO_LLM') != '1':
+        env.update(run_environment())
     return env
 
 
-def run_soundness_pipeline(research_plan_file, save_dir, cutoff_date, llm_engine_name, litellm_name):
+def run_soundness_pipeline(research_plan_file, save_dir, cutoff_date, llm_engine_name, litellm_name, stop_after_retrieval=False):
     """Run the soundness evaluation pipeline."""
     print("\n=== Starting Soundness Pipeline ===")
     
@@ -40,8 +50,7 @@ def run_soundness_pipeline(research_plan_file, save_dir, cutoff_date, llm_engine
     
     # Copy research plan to soundness directory
     input_file = soundness_dir / "research_plan.txt"
-    with open(research_plan_file, 'r') as src, open(input_file, 'w') as dst:
-        dst.write(src.read())
+    copy_research_plan(research_plan_file, input_file)
     
     # Step 1: Extract methods
     print("\n1. Extracting methods from research plan...")
@@ -86,6 +95,10 @@ def run_soundness_pipeline(research_plan_file, save_dir, cutoff_date, llm_engine
         cmd3.extend(["--cutoff_date", cutoff_date])
     if not run_command(cmd3, env=env):
         return False
+
+    if stop_after_retrieval:
+        print('Stopped after soundness retrieval as requested.')
+        return True
     
     # Step 4: Methods and results synthesis
     print("\n4. Analyzing existing methods in literature...")
@@ -150,8 +163,7 @@ def run_contribution_pipeline(research_plan_file, save_dir, cutoff_date, llm_eng
     
     # Copy research plan to contribution directory
     input_file = contribution_dir / "research_plan.txt"
-    with open(research_plan_file, 'r') as src, open(input_file, 'w') as dst:
-        dst.write(src.read())
+    copy_research_plan(research_plan_file, input_file)
     
     # Step 1: Extract dimensions and contributions
     print("\n1. Extracting dimensions and contributions...")
@@ -304,16 +316,28 @@ def run_contribution_pipeline(research_plan_file, save_dir, cutoff_date, llm_eng
     return True
 
 
+def copy_research_plan(source, target):
+    # Read before writing (source may be the saved plan itself); preserve mtime on resume.
+    content = Path(source).read_bytes()
+    if not target.exists() or target.read_bytes() != content:
+        target.write_bytes(content)
+
+
 def main():
     parser = argparse.ArgumentParser(description="ScholarEval: Research Idea Evaluation Pipeline")
     parser.add_argument("--research_idea", required=True, help="Path to txt file containing research idea")
     parser.add_argument("--cutoff_date", help="Cutoff date for literature search (YYYY-MM-DD or 'none')")
     parser.add_argument("--llm_engine_name", required=True, help="LLM engine name")
     parser.add_argument("--save_to", required=True, help="Directory to save all intermediate files")
+    parser.add_argument('--resume', action='store_true', help='Reuse validated, input-matching stage checkpoints')
+    parser.add_argument('--no-llm', action='store_true', help='Fail before any stage requiring an uncached LLM call')
+    parser.add_argument('--stop-after-retrieval', action='store_true', help='Stop after soundness snippet/PDF retrieval')
     parser.add_argument("--litellm_name", default="claude-sonnet-4-20250514", 
                         help="LiteLLM name for cost computation (default: claude-sonnet-4-20250514)")
     
     args = parser.parse_args()
+    os.environ['SCHOLAREVAL_RESUME'] = '1' if args.resume else '0'
+    os.environ['SCHOLAREVAL_NO_LLM'] = '1' if args.no_llm else '0'
     
     # Validate inputs
     if not os.path.exists(args.research_idea):
@@ -326,6 +350,10 @@ def main():
     # Create save directory
     save_dir = Path(args.save_to)
     save_dir.mkdir(parents=True, exist_ok=True)
+    if os.environ.get('SCHOLAREVAL_LLM_BACKEND', 'litellm').lower() == 'codex':
+        args.litellm_name = None  # API price tables do not describe included Codex usage.
+        if not args.no_llm:
+            run_environment(cache_path=os.environ.get('SCHOLAREVAL_CODEX_CACHE') or str(save_dir / 'codex-responses.sqlite3'))
     
     print(f"Starting ScholarEval pipeline...")
     print(f"Research idea: {args.research_idea}")
@@ -338,9 +366,12 @@ def main():
     
     # Run soundness pipeline
     if not run_soundness_pipeline(args.research_idea, save_dir, cutoff_date, 
-                                  args.llm_engine_name, args.litellm_name):
+                                  args.llm_engine_name, args.litellm_name, args.stop_after_retrieval):
         print("Soundness pipeline failed!")
         return 1
+
+    if args.stop_after_retrieval:
+        return 0
     
     # Run contribution pipeline
     if not run_contribution_pipeline(args.research_idea, save_dir, cutoff_date,
@@ -361,4 +392,10 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except CodexError as error:
+        print(f"Codex backend stopped: {error}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        close_run()

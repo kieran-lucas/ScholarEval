@@ -1,1 +1,6 @@
 demo_data/
+__pycache__/
+.codex-schema/
+.codex-schema-experimental/
+.venv/
+.scholareval-codex/

@@ -11,4 +11,5 @@ numpy
 python-dateutil
 pandas
 jsonschema
+scikit-learn
 

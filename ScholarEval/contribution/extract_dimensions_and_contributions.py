@@ -106,7 +106,7 @@ def main():
             "input_tokens": input_tokens,
             "output_tokens": output_tokens
         }
-        with open(args.cost_log_file, 'a') as f:
+        with open(args.cost_log_file, 'a', encoding='utf-8') as f:
             json.dump(cost_entry, f)
             f.write('\n')
     

@@ -25,7 +25,7 @@ def main():
     with open(args.research_plan, "r", encoding="utf-8") as f:
         rp = f.read()
 
-    with open(args.methods_file) as f:
+    with open(args.methods_file, encoding='utf-8') as f:
         clean_methods = json.load(f)['clean_methods']
 
     queries = {}
@@ -59,7 +59,14 @@ def main():
             )
         }
         ]
-        response, input_tokens, output_tokens = llm.respond(prompt, temperature=0.3)
+        from ScholarEval.utils.durable import ItemStore
+        def execute_query():
+            text, inputs, outputs = llm.respond(prompt, temperature=0.3)
+            query = su.extract_json_output(text)['query']
+            return query, inputs, outputs
+        clean_query, input_tokens, output_tokens = ItemStore.current('soundness_queries').run(
+            prompt, execute_query, lambda result: isinstance(result, (tuple, list)) and len(result) == 3
+                and isinstance(result[0], str) and bool(result[0].strip()))
         
         if args.litellm_name:
             if args.litellm_name == "meta_llama/Llama-3.3-70B-Instruct":
@@ -73,7 +80,6 @@ def main():
         total_input_tokens += input_tokens
         total_output_tokens += output_tokens
         
-        clean_query = su.extract_json_output(response)['query']
         queries[method] = clean_query
 
     if args.litellm_name:
@@ -88,11 +94,11 @@ def main():
             "input_tokens": total_input_tokens,
             "output_tokens": total_output_tokens
         }
-        with open(args.cost_log_file, 'a') as f:
+        with open(args.cost_log_file, 'a', encoding='utf-8') as f:
             json.dump(cost_entry, f)
             f.write('\n')
 
-    with open(args.output_file, 'w') as f:
+    with open(args.output_file, 'w', encoding='utf-8') as f:
         json.dump({'queries': queries}, f, indent=4)
 
 if __name__ == '__main__':

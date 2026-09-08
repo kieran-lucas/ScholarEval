@@ -9,12 +9,14 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
+from .durable import atomic_text, metric
+from .workflow_errors import ConfigurationError
 
 import requests
 
 
 class GrobidStartupError(RuntimeError):
-    pass
+    retryable = True
 
 
 class GrobidService:
@@ -36,9 +38,9 @@ class GrobidService:
 
     def docker(self, *args, timeout=20):
         if not shutil.which('docker'):
-            raise GrobidStartupError('Docker CLI unavailable; install Docker Desktop and reopen the shell')
+            raise ConfigurationError('Docker CLI unavailable; install Docker Desktop and reopen the shell')
         try:
-            result = subprocess.run(['docker', *args], capture_output=True, text=True, timeout=timeout)
+            result = subprocess.run(['docker', *args], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout)
         except (OSError, subprocess.TimeoutExpired):
             raise GrobidStartupError('Docker command unavailable/timed out; check Docker Desktop daemon') from None
         if result.returncode:
@@ -84,7 +86,7 @@ class GrobidService:
             state = info.get('State', {})
             # Docker logs often go to stderr; obtain both streams, bounded.
             result = subprocess.run(['docker', 'logs', '--tail', '20', self.container],
-                                    capture_output=True, text=True, timeout=10)
+                                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=10)
             logs = (result.stdout + result.stderr)[-4000:]
             for name, value in os.environ.items():
                 if value and len(value) >= 6 and any(x in name.upper() for x in ('KEY', 'TOKEN', 'SECRET', 'PASSWORD')):
@@ -108,6 +110,18 @@ class GrobidService:
                 self.sleep(min(self.interval, remaining))
         raise GrobidStartupError(f'GROBID failed to become ready after {self.timeout:g}s\n{self.diagnostics()}')
 
+    def recover_owned(self):
+        """Restart only our explicitly named, compatible container."""
+        if not self.container:
+            return False
+        info = json.loads(self.docker('inspect', self.container))[0]
+        if info.get('Name') != '/' + self.name or not self.compatible(info):
+            return False
+        self.docker('restart', self.container)
+        metric('grobid.restarts')
+        self.wait_ready()
+        return True
+
     def ensure_ready(self):
         start = self.clock()
         try:
@@ -123,6 +137,11 @@ class GrobidService:
             if owners:
                 chosen = owners[0]
                 self.metrics['grobid_action'] = 'reused'
+                if chosen.get('Name') == '/' + self.name and not self.healthy():
+                    self.container = chosen['Id']
+                    self.docker('restart', self.container)
+                    self.metrics['grobid_action'] = 'restarted-owned'
+                    metric('grobid.restarts')
             else:
                 if self.port_open():
                     raise GrobidStartupError(f'Port {self.port} is occupied by an unverified process; no containers changed')
@@ -194,8 +213,8 @@ def parse_pdf_corpus(pdf_paths, pdf_dir, on_result, config='./GROBID_config.json
                     return response, response.status_code
 
         client = BoundedClient(config_path=config)
-        workers = int(os.environ.get('SCHOLAREVAL_GROBID_WORKERS', '10'))
-        timeout = float(os.environ.get('SCHOLAREVAL_GROBID_PARSE_TIMEOUT_SECONDS', '60'))
+        workers = int(os.environ.get('SCHOLAREVAL_GROBID_WORKERS', '1'))
+        timeout = float(os.environ.get('SCHOLAREVAL_GROBID_PARSE_TIMEOUT_SECONDS', '300'))
         if not 1 <= workers <= 10 or not 0 < timeout <= 3600:
             raise ValueError('GROBID workers must be 1..10 and parse timeout must be > 0 and <= 3600 seconds')
         # Preserve the configured timeout unless the caller explicitly overrides it.
@@ -218,7 +237,7 @@ def parse_pdf_corpus(pdf_paths, pdf_dir, on_result, config='./GROBID_config.json
                     if root.tag.split('}')[-1] != 'TEI':
                         raise ValueError('not TEI XML')
                     target = Path(pdf_dir) / (pdf.stem + '.grobid.tei.xml')
-                    target.write_text(content, encoding='utf-8')
+                    atomic_text(target, content)
                     record.update(status='parsed', xml_sha256=file_hash(target))
                     return record
                 except (ET.ParseError, ValueError):
@@ -226,6 +245,8 @@ def parse_pdf_corpus(pdf_paths, pdf_dir, on_result, config='./GROBID_config.json
                     return record
             record.update(status='parse_failed', failure_reason=f'GROBID HTTP {status}; no usable full text',
                           failure_detail=content[:1000] if isinstance(content, str) else None)
+            if status in (408, 429, 500, 502, 503, 504):
+                record['status'] = 'parse_retryable'
             return record
 
         results = {}
@@ -236,17 +257,19 @@ def parse_pdf_corpus(pdf_paths, pdf_dir, on_result, config='./GROBID_config.json
                 record = future.result()
                 results[pdf.stem] = record
                 on_result(pdf.stem, record)
+                metric('grobid.' + record['status'])
                 print(f'GROBID {pdf.stem}: {record["status"]}', flush=True)
         healthy = service.healthy()
         systemic = (not any(r['status'] == 'parsed' for r in results.values()) and
                     all(r.get('http_status', 0) in (408, 429, 500, 502, 503, 504) for r in results.values()))
-        if not healthy or systemic:
+        if not healthy or systemic or any(r['status'] == 'parse_retryable' for r in results.values()):
             # Infrastructure failures remain retryable on resume, even when health
             # is superficially green (e.g. every document returned HTTP 500).
             for cid, record in results.items():
                 if record['status'] != 'parsed':
                     record['status'] = 'parse_retryable'
                     on_result(cid, record)
+            service.recover_owned()
             raise GrobidStartupError('GROBID service/systemic parsing failure; partial progress saved\n' + service.diagnostics())
         return results
     finally:

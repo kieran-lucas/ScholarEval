@@ -528,8 +528,9 @@ class BackendTests(unittest.TestCase):
             else:
                 original(request)
         process.receive = receive
+        engine, _ = self.engine(process)
         with self.assertRaises(CodexQuotaError):
-            self.engine(process)
+            engine.respond([{'role': 'user', 'content': 'uncached'}])
         self.assertEqual(process.turn_count, 0)
 
     def test_no_auth_data_in_status(self):

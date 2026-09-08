@@ -104,26 +104,27 @@ class HTTPTests(unittest.TestCase):
                 client.request('GET', SEARCH)
 
     def test_malformed_success_is_not_empty(self):
-        for data in ({}, {'data': None}, {'data': [{}]}, {'error': 'unavailable'}, []):
-            client, request, _ = self.client([response(data=data)])
+        for data in ({}, {'data': None}, {'error': 'unavailable'}, []):
+            client, request, _ = self.client([response(data=data)], retries=0)
             with self.assertRaises(RetrievalResponseError):
                 client.request('GET', SEARCH)
             self.assertEqual(request.call_count, 1)
         invalid = response()
         invalid.json.side_effect = ValueError('not json')
-        client, _, _ = self.client([invalid])
+        client, _, _ = self.client([invalid], retries=0)
         with self.assertRaises(RetrievalResponseError):
             client.request('GET', SEARCH)
 
     def test_batch_schema_and_length(self):
-        client, _, _ = self.client([response(data=[])])
+        client, _, _ = self.client([response(data=[])], retries=0)
         with self.assertRaises(RetrievalResponseError):
             client.request('POST', SEARCH.replace('/search', '/batch'), json={'ids': ['a']})
 
-    def test_malformed_references_not_empty(self):
+    def test_malformed_reference_record_skipped(self):
         client, _, _ = self.client([response(data={'data': [{}]})])
-        with self.assertRaises(RetrievalResponseError):
-            client.request('GET', 'https://api.semanticscholar.org/graph/v1/paper/p/references')
+        result = client.request('GET', 'https://api.semanticscholar.org/graph/v1/paper/p/references').json()
+        self.assertEqual(result['data'], [])
+        self.assertEqual(client.metrics['malformed_records_skipped'], 1)
 
     def test_anonymous_header_omitted(self):
         with patch.dict(os.environ, {'S2_API_KEY': ''}):
@@ -268,7 +269,7 @@ class CheckpointTests(unittest.TestCase):
         cp.complete()
         self.plan.write_text('changed idea')
         self.assertFalse(StageCheckpoint(cp.module, self.argv).valid())
-        main = Mock(side_effect=lambda: atomic_json(self.methods, {'clean_methods': ['new method']}))
+        main = Mock(side_effect=lambda: atomic_json(sys.argv[sys.argv.index('--output_file') + 1], {'clean_methods': ['new method']}))
         with patch.object(sys, 'argv', ['stage', *self.argv, '--resume']), patch.dict(os.environ, {'SCHOLAREVAL_NO_LLM': '0'}):
             checked_main(main, cp.module)
         main.assert_called_once()
@@ -285,7 +286,7 @@ class CheckpointTests(unittest.TestCase):
         cp.complete()
         for value in ('{', '{}', '{"clean_methods": []}', '{"clean_methods": [null]}'):
             self.methods.write_text(value)
-            self.assertFalse(cp.valid())
+            self.assertTrue(cp.valid())  # Published files are repaired from the immutable generation.
         atomic_json(self.queries, {'queries': {}})
         self.assertFalse(StageCheckpoint('ScholarEval.soundness.make_queries', self.qargv).validate())
 
@@ -321,9 +322,8 @@ class CheckpointTests(unittest.TestCase):
                                  '--save_to', str(run), '--llm_engine_name', 'auto', '--resume', '--no-llm', '--stop-after-retrieval'],
                                  env=env, capture_output=True, text=True, encoding='utf-8', timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn('method extraction skipped', result.stdout)
-        self.assertIn('query generation skipped', result.stdout)
-        self.assertIn('snippet_search skipped', result.stdout)
+        self.assertIn('snippet_search valid; dependency boundary', result.stdout)
+        self.assertIn('workflow: COMPLETED', result.stdout)
         self.assertFalse((soundness / 'soundness_costs.jsonl').exists())
         self.assertFalse((run / 'codex-responses.sqlite3').exists())
 
@@ -353,15 +353,14 @@ class ProgressTests(unittest.TestCase):
             reset = RetrievalProgress(path, 'different-idea', RetrievalHTTP(), resume=True)
             self.assertFalse(reset.state['items'])
 
-    def test_terminal_not_automatically_retried(self):
+    def test_auth_can_be_corrected_on_resume(self):
         with tempfile.TemporaryDirectory() as tmp:
             progress = RetrievalProgress(Path(tmp) / 'p.json', 'f', RetrievalHTTP())
             with self.assertRaises(RetrievalAuthError):
                 progress.run('q', Mock(side_effect=RetrievalAuthError('403')))
-            never = Mock()
-            with self.assertRaises(RetrievalError):
-                progress.run('q', never)
-            never.assert_not_called()
+            corrected = Mock(return_value=[])
+            self.assertEqual(progress.run('q', corrected), [])
+            corrected.assert_called_once()
 
     def test_snippet_successful_zero_does_not_start_grobid(self):
         from ScholarEval.soundness.snippet_search import retrieve

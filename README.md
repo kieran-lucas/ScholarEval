@@ -104,3 +104,17 @@ If you find **ScholarEval** or **ScholarIdeas** useful in your work, please cite
 Use `--resume` to reuse validated stage checkpoints after infrastructure failures.
 For Semantic Scholar keys/backoff, Docker/GROBID readiness, and commands that debug
 retrieval without any Astra calls, see [the retrieval guide](docs/RETRIEVAL_RELIABILITY.md).
+
+The canonical CLI now uses a durable dependency graph, immutable stage generations,
+per-item checkpoints, and bounded dependency recovery. See the
+[hardening report and operating instructions](docs/RELIABILITY_HARDENING_REPORT.md)
+for migration evidence, tests, configuration requirements, and remaining acceptance work.
+
+```powershell
+.\.venv\Scripts\python.exe -m ScholarEval.ScholarEval --research_idea test_idea.txt --llm_engine_name auto --save_to demo_data/astra-test-1 --resume
+```
+
+Append `--dry-run` for an offline dependency/resume inspection. Full runs require
+`S2_API_KEY`; the existing Titan embedding filter separately requires explicit
+`API_KEY` and `API_ENDPOINT`. The CLI defaults to the managed Codex backend and
+does not select a paid inference fallback.

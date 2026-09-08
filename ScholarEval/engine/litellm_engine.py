@@ -11,6 +11,9 @@ class LiteLLMEngine:
         
 
     def respond(self, user_input, temperature = 0.7, top_p = 0.95, max_tokens = 40000):
+        if os.environ.get('SCHOLAREVAL_OFFLINE') == '1' or os.environ.get('SCHOLAREVAL_NO_LLM') == '1':
+            from ScholarEval.utils.workflow_errors import ConfigurationError
+            raise ConfigurationError('Offline/no-LLM guard: API inference refused')
         response = self.client.chat.completions.create(model=self.llm_engine_name,messages=user_input, temperature=temperature, top_p=top_p, max_tokens=max_tokens)
         
         return response.choices[0].message.content, response.usage.prompt_tokens, response.usage.completion_tokens

@@ -104,6 +104,8 @@ def main():
     parser.add_argument("--max_workers", type=int, default=8, help="Maximum number of parallel workers")
     parser.add_argument("--cost_log_file", help="Path to centralized cost log file")
     args = parser.parse_args()
+    if os.environ.get('SCHOLAREVAL_LLM_BACKEND') == 'codex':
+        args.max_workers = int(os.environ.get('SCHOLAREVAL_CODEX_MAX_CONCURRENCY', '1'))
     
     API_KEY = os.environ.get("API_KEY")
     API_ENDPOINT = os.environ.get("API_ENDPOINT")
@@ -138,10 +140,18 @@ def main():
     
     def process_ref_wrapper(method_ref_tuple):
         method, ref = method_ref_tuple
-        llm, su = get_thread_instances()
-        return method, process_reference(rp, method, ref, clean_ref_and_paper, llm, su, llm_cost, args.litellm_name)
+        from ScholarEval.utils.durable import ItemStore
+        from ScholarEval.utils.checkpoints import has_error
+        def execute():
+            llm, su = get_thread_instances()
+            return process_reference(rp, method, ref, clean_ref_and_paper, llm, su, llm_cost, args.litellm_name)
+        result = ItemStore.current('methods').run([rp, method, ref, clean_ref_and_paper.get(ref)], execute,
+            lambda value: isinstance(value, dict) and value.get('corpus_id') == ref
+                          and isinstance(value.get('analysis'), (dict, list)) and not has_error(value))
+        return method, result
     
     for method, references in tqdm(clean_methods_refs.items(), desc='Analyzing Sources'):
+        all_methods_analysis[method] = []
         
         tasks = [(method, ref) for ref in references]
         
@@ -164,13 +174,12 @@ def main():
                         total_output_tokens += result.get('output_tokens', 0)
                         
                 except Exception as e:
-                    if isinstance(e, CodexError):
-                        raise
-                    task = future_to_task[future]
-                    print(f"Error processing {task}: {e}")
+                    for pending in future_to_task:
+                        pending.cancel()
+                    raise
         
         # Save progress after each method
-        with open(args.output_file, 'w') as f:
+        with open(args.output_file, 'w', encoding='utf-8') as f:
             json.dump({
                 'analysis': all_methods_analysis
             }, f, indent=4)
@@ -185,7 +194,7 @@ def main():
             "input_tokens": total_input_tokens,
             "output_tokens": total_output_tokens
         }
-        with open(args.cost_log_file, 'a') as f:
+        with open(args.cost_log_file, 'a', encoding='utf-8') as f:
             json.dump(cost_entry, f)
             f.write('\n')
         

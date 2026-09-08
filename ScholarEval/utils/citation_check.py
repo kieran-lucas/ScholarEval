@@ -79,7 +79,10 @@ def check_and_format_citations(report_file: str, bibliography_file: str, llm_eng
         }
     ]
     
-    response, _, _ = llm.respond(prompt, temperature=0.1)
+    from .durable import ItemStore
+    response = ItemStore.current('citation_formatting').run(prompt,
+        lambda: llm.respond(prompt, temperature=0.1)[0],
+        lambda value: isinstance(value, str) and bool(value.strip()))
     return response.strip()
 
 
@@ -153,7 +156,10 @@ def check_citations_from_strings(report_content: str, bibliography_content: str,
         }
     ]
     
-    response, _, _ = llm.respond(prompt, temperature=0.1)
+    from .durable import ItemStore
+    response = ItemStore.current('citation_formatting').run(prompt,
+        lambda: llm.respond(prompt, temperature=0.1)[0],
+        lambda value: isinstance(value, str) and bool(value.strip()))
     return response.strip()
 
 

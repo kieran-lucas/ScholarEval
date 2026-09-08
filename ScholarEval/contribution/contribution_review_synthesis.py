@@ -95,7 +95,7 @@ def compute_final_score(comparisons: list) -> str:
                 total += score
                 count += 1
     score = (total * 10) / count if count > 0 else None
-    return f"{score:.2f}"
+    return f"{score:.2f}" if score is not None else 'Undetermined: no comparisons available'
 
 def extract_bibliography(comparisons: list) -> str:
     """Extract all paperReference fields from comparisons and format as bibliography"""
@@ -175,7 +175,7 @@ def main():
             "input_tokens": input_tokens,
             "output_tokens": output_tokens
         }
-        with open(args.cost_log_file, 'a') as f:
+        with open(args.cost_log_file, 'a', encoding='utf-8') as f:
             json.dump(cost_entry, f)
             f.write('\n')
     

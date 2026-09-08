@@ -82,7 +82,10 @@ def main():
     total_output_tokens = 0
     
     for contrib in contributions:
-        queries, input_tokens, output_tokens = generate_queries_for_contribution(llm, contrib, research_plan)
+        from ScholarEval.utils.durable import ItemStore
+        queries, input_tokens, output_tokens = ItemStore.current('contribution_queries').run(
+            [research_plan, contrib, 3], lambda: generate_queries_for_contribution(llm, contrib, research_plan),
+            lambda result: isinstance(result, (tuple, list)) and len(result) == 3 and bool(result[0]))
         if args.litellm_name:
             if args.litellm_name == "meta_llama/Llama-3.3-70B-Instruct":
                 cost = 0
@@ -106,7 +109,7 @@ def main():
             "input_tokens": total_input_tokens,
             "output_tokens": total_output_tokens
         }
-        with open(args.cost_log_file, 'a') as f:
+        with open(args.cost_log_file, 'a', encoding='utf-8') as f:
             json.dump(cost_entry, f)
             f.write('\n')
 

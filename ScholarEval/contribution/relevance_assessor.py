@@ -20,8 +20,10 @@ def main():
     parser.add_argument("--max_workers", type=int, default=1, help="Maximum number of parallel workers")
     parser.add_argument("--cost_log_file", help="Path to centralized cost log file")
     args = parser.parse_args()
+    if os.environ.get('SCHOLAREVAL_LLM_BACKEND') == 'codex':
+        args.max_workers = int(os.environ.get('SCHOLAREVAL_CODEX_MAX_CONCURRENCY', '1'))
 
-    with open(args.research_plan, "r") as f:
+    with open(args.research_plan, "r", encoding='utf-8') as f:
         plan = f.read()
     with open(args.papers_file, "r", encoding="utf-8") as f:
         papers = json.load(f)
@@ -47,7 +49,7 @@ def main():
     def assess_paper_relevance(paper):
         """Assess relevance of a single paper using thread-local LLM."""
         nonlocal total_cost, total_input_tokens, total_output_tokens
-        logging.info(f"Assessing relevance for paper: {paper['paperId']} - {paper['title'][:60]}")
+        logging.info(f"Assessing relevance for paper: {paper['paperId']} - {str(paper.get('title') or '')[:60]}")
         llm = get_thread_llm()
         
         prompt = [
@@ -146,8 +148,8 @@ def main():
             assessment = json.loads(json_str)
             
             paper_with_assessment = paper.copy()
-            paper_with_assessment['relevance_score'] = assessment.get('score', 0)
-            paper_with_assessment['relevance_rationale'] = assessment.get('rationale', 'No rationale provided')
+            paper_with_assessment['relevance_score'] = assessment.get('score')
+            paper_with_assessment['relevance_rationale'] = assessment.get('rationale')
             paper_with_assessment['cost'] = cost
             paper_with_assessment['input_tokens'] = input_tokens
             paper_with_assessment['output_tokens'] = output_tokens
@@ -156,41 +158,8 @@ def main():
             return paper_with_assessment
             
         except (json.JSONDecodeError, ValueError, KeyError) as e:
-            logging.warning(f"Failed to parse LLM response for paper {paper['paperId']}: {e}")
-            paper_with_assessment = paper.copy()
-            paper_with_assessment['relevance_score'] = 0
-            paper_with_assessment['relevance_rationale'] = f"Failed to parse assessment: {resp[:200]}..."
-            paper_with_assessment['cost'] = cost
-            paper_with_assessment['input_tokens'] = input_tokens
-            paper_with_assessment['output_tokens'] = output_tokens
-            logging.info("  -> Score: 0 (parsing failed)")
-            return paper_with_assessment
-
-    # PARTIAL_RELEVANCE_RESUME_V1
-    # Recover per-paper results left by an interrupted previous run.
-    if os.path.exists(args.output_file):
-        try:
-            with open(args.output_file, "r", encoding="utf-8") as f:
-                previous_output = json.load(f)
-
-            previous_scored = {
-                item.get("paperId"): item
-                for item in previous_output.get("papers", [])
-                if item.get("paperId") and "relevance_score" in item
-            }
-
-            if previous_scored:
-                papers = [
-                    previous_scored.get(item.get("paperId"), item)
-                    for item in papers
-                ]
-                logging.info(
-                    f"Recovered {len(previous_scored)} previously scored papers "
-                    "from partial output"
-                )
-        except (OSError, ValueError, TypeError):
-            logging.warning("Ignoring unreadable partial relevance output")
-
+            from ScholarEval.utils.workflow_errors import ScientificValidationError
+            raise ScientificValidationError('Relevance response could not be parsed; no score fabricated') from e
     # Filter out papers with null abstracts before processing
     papers_with_abstracts = [paper for paper in papers if paper.get('abstract')]
     logging.info(f"Filtered out {len(papers) - len(papers_with_abstracts)} papers with null abstracts")
@@ -204,19 +173,14 @@ def main():
     # Process papers that need scoring in parallel
     relevant = already_scored.copy()  # Start with already scored papers
 
-    def persist_partial():
-        temp_path = args.output_file + ".tmp"
-        with open(temp_path, "w", encoding="utf-8") as f:
-            json.dump(
-                {"papers": relevant},
-                f,
-                indent=2,
-                ensure_ascii=False
-            )
-        os.replace(temp_path, args.output_file)
+    from ScholarEval.utils.durable import ItemStore
+    from ScholarEval.utils.checkpoints import valid_relevance
+    def durable_assess(paper):
+        return ItemStore.current('relevance').run([plan, paper],
+            lambda: assess_paper_relevance(paper), valid_relevance)
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
         future_to_paper = {
-            executor.submit(assess_paper_relevance, paper): paper 
+            executor.submit(durable_assess, paper): paper
             for paper in needs_scoring
         }
         
@@ -224,21 +188,13 @@ def main():
             try:
                 paper_with_assessment = future.result()
                 relevant.append(paper_with_assessment)
-                persist_partial()
-            except Exception as e:
-                if isinstance(e, CodexError):
-                    for pending in future_to_paper:
-                        if pending is not future:
-                            pending.cancel()
-                    raise
-                paper = future_to_paper[future]
-                logging.error(f"Error processing paper {paper['paperId']}: {e}")
-                paper_with_assessment = paper.copy()
-                paper_with_assessment['relevance_score'] = 0
-                paper_with_assessment['relevance_rationale'] = f"Processing error: {str(e)}"
-                relevant.append(paper_with_assessment)
-                persist_partial()
-    
+            except Exception:
+                for pending in future_to_paper:
+                    pending.cancel()
+                raise
+    # Stable paper ordering prevents scheduling from changing sampling ties.
+    order = {p['paperId']: i for i, p in enumerate(papers_with_abstracts)}
+    relevant.sort(key=lambda p: order[p['paperId']])
     print(f"Total LLM cost for contribution_relevance_assessor: ${total_cost:.6f}")
     logging.info(f"{len(relevant)} papers assessed with relevance scores.")
     
@@ -250,7 +206,7 @@ def main():
             "input_tokens": total_input_tokens,
             "output_tokens": total_output_tokens
         }
-        with open(args.cost_log_file, 'a') as f:
+        with open(args.cost_log_file, 'a', encoding='utf-8') as f:
             json.dump(cost_entry, f)
             f.write('\n')
     

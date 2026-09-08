@@ -13,6 +13,9 @@ thread_local = threading.local()
 def get_thread_client():
     """Get thread-local OpenAI client"""
     if not hasattr(thread_local, 'client'):
+        from ScholarEval.utils.workflow_errors import ConfigurationError
+        if not os.environ.get('API_KEY') or not os.environ.get('API_ENDPOINT'):
+            raise ConfigurationError('Explicit embedding API_KEY/API_ENDPOINT required; no default paid endpoint')
         thread_local.client = openai.OpenAI(
             api_key=os.environ.get("API_KEY"),
             base_url=os.environ.get("API_ENDPOINT")
@@ -21,13 +24,22 @@ def get_thread_client():
 
 def get_embedding(text: str) -> List[float]:
     """Get embedding for text using Titan Text Embeddings V2"""
-    client = get_thread_client()
-    response = client.embeddings.create(
-        input=text,
-        model="Titan Text Embeddings V2",
-        encoding_format=None 
-    )
-    return response.data[0].embedding
+    from ScholarEval.utils.durable import ItemStore
+    from ScholarEval.utils.workflow_errors import ConfigurationError, NetworkTransientError, AuthenticationError
+    import math
+    def execute():
+        if os.environ.get('SCHOLAREVAL_NO_LLM') == '1':
+            raise ConfigurationError('No-LLM guard: uncached embedding request refused')
+        client = get_thread_client()
+        try:
+            response = client.embeddings.create(input=text, model='Titan Text Embeddings V2', encoding_format=None)
+        except (openai.AuthenticationError, openai.PermissionDeniedError) as error:
+            raise AuthenticationError('Embedding service rejected credentials') from error
+        except (openai.APIConnectionError, openai.APITimeoutError, openai.RateLimitError, openai.InternalServerError) as error:
+            raise NetworkTransientError('Embedding service temporarily unavailable') from error
+        return response.data[0].embedding
+    return ItemStore.current('embeddings').run([os.environ.get('API_ENDPOINT'), 'Titan Text Embeddings V2', text], execute,
+        lambda v: isinstance(v, list) and bool(v) and all(isinstance(x, (int, float)) and math.isfinite(x) for x in v) and any(v))
 
 def load_research_plan(file_path: str) -> str:
     """Load research plan from file"""
@@ -128,9 +140,9 @@ def main():
                     print(f"Processed {completed_count}/{len(papers_to_filter)} papers")
                     
             except Exception as e:
-                i = future_to_index[future]
-                print(f"Error processing paper {i}: {e}")
-                paper_embeddings[i] = [0.0] * len(plan_embedding)
+                for pending in future_to_index:
+                    pending.cancel()
+                raise
     
     print("Calculating cosine similarities...")
     similarities = calculate_similarities(plan_embedding, paper_embeddings)

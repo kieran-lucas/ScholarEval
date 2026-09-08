@@ -74,7 +74,7 @@ def main():
     if not os.path.exists(args.input_file):
         raise FileNotFoundError(f"Input file {args.input_file} does not exist.")
     
-    with open(args.input_file, 'r') as f:
+    with open(args.input_file, 'r', encoding='utf-8') as f:
         try:
             papers = json.load(f)["comparisons"]
             if not isinstance(papers, list):
@@ -90,7 +90,7 @@ def main():
             "comparison": paper.get("comparison")
         })
     # Write context to output file
-    with open(args.output_file, 'w') as f:
+    with open(args.output_file, 'w', encoding='utf-8') as f:
         json.dump(context, f, indent=4)
 
 if __name__ == "__main__":

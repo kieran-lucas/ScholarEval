@@ -123,7 +123,8 @@ class SemanticScholar():
         response = self.http.request("GET", url, params=params, headers=headers, timeout=30)
         response.raise_for_status()
         refs = response.json().get("data", [])
-        return [ref["citedPaper"] for ref in refs if ref.get("isInfluential")]
+        return [ref["citedPaper"] for ref in refs if isinstance(ref, dict) and ref.get("isInfluential")
+                and isinstance(ref.get('citedPaper'), dict) and ref['citedPaper'].get('paperId')]
 
     def extract_metadata(self, paper: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -276,21 +277,34 @@ class SemanticScholar():
             }
             resp = self.http.request("GET", url, params=params, headers=headers, timeout=30)
             resp.raise_for_status()
-            data = resp.json().get("data", [])
+            payload = resp.json()
+            data = payload.get("data", [])
+            raw_count = payload.get('_raw_count', len(data))
 
-            if not data:
+            if not raw_count:
                 break
 
             for ref in data:
+                if not isinstance(ref, dict):
+                    continue
                 cited = ref.get("citedPaper")
-                if cited:
+                # Skip incomplete S2 reference records rather than failing
+                # the entire augmentation stage.
+                if isinstance(cited, dict) and cited.get("paperId"):
                     references.append(cited)
                     if max_references and len(references) >= max_references:
                         return references
 
-            offset += len(data)
+            next_offset = payload.get('next')
+            if next_offset is not None:
+                if not isinstance(next_offset, int) or next_offset <= offset:
+                    from .retrieval_http import RetrievalResponseError
+                    raise RetrievalResponseError('References pagination did not advance')
+                offset = next_offset
+            else:
+                offset += raw_count
             # Stop if fewer records than requested were returned (last page)
-            if len(data) < limit:
+            if next_offset is None and raw_count < limit:
                 break
         return references
     def get_paper_details(
@@ -356,6 +370,9 @@ class SemanticScholar():
         """Works directly with S2 paper ids"""
         if not paper_ids:
             return []
+        if len(paper_ids) > 500:
+            return [paper for start in range(0, len(paper_ids), 500)
+                    for paper in self.get_paper_bulk(paper_ids[start:start + 500], fields)]
         url = "https://api.semanticscholar.org/graph/v1/paper/batch"
         if not fields:
             fields = [
@@ -380,7 +397,8 @@ class SemanticScholar():
         """Format author names for citations"""
         if not authors_list:
             return "unknown_author"
-        names = [author['name'].split(' ')[-1] for author in authors_list]
+        names = [author['name'].split(' ')[-1] for author in authors_list
+                 if isinstance(author, dict) and isinstance(author.get('name'), str) and author['name']]
 
         if not names:
             return "unknown_author"

@@ -139,14 +139,14 @@ def retrieve(args, s2, progress, metrics):
         raise ValueError('SCHOLAREVAL_FULL_TEXT_POLICY must be available-evidence or require-full-text')
     print(f'{len(candidates)} papers discovered\n{len(valid)} full text available\n'
           f'{metrics["pdfs_unavailable"]} full text unavailable\ncontinuing with available evidence', flush=True)
-    parse_path = Path(args.output_file + '_parse_progress.json')
-    parse_version = digest([file_hash(Path(__file__).resolve().parents[1] / 'utils/grobid.py'),
-                            file_hash('GROBID_config.json'),
-                            os.environ.get('SCHOLAREVAL_GROBID_PARSE_TIMEOUT_SECONDS'),
-                            os.environ.get('SCHOLAREVAL_GROBID_WORKERS', '10')])
+    primary = os.environ.get('SCHOLAREVAL_STAGE_PRIMARY', args.output_file)
+    parse_path = Path(primary + '_parse_progress.json')
+    parse_version = 'grobid-tei-v1'
     try:
         parse_state = json.loads(parse_path.read_text(encoding='utf-8'))
-        if parse_state.get('version') != parse_version:
+        # Old records are safe to reuse only with matching PDF and XML hashes
+        # below. Operational timeout/worker changes do not invalidate parsing.
+        if not isinstance(parse_state, dict):
             parse_state = {}
     except (OSError, ValueError):
         parse_state = {}

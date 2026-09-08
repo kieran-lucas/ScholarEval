@@ -24,6 +24,8 @@ from .codex_transport import (
     CodexQuotaError, CodexTimeoutError, JsonRpcClient, codex_version,
     find_codex, server_error,
 )
+from ScholarEval.utils.durable import metric
+from ScholarEval.utils.workflow_errors import ScientificValidationError
 
 LOG = logging.getLogger(__name__)
 TRANSPORT_INSTRUCTIONS = (
@@ -178,6 +180,9 @@ def validate_output(text, messages, output_schema=None):
 
 class CodexAppServerEngine:
     def __init__(self, *, client=None, status=None, cache_path=None):
+        if client is None and os.environ.get('SCHOLAREVAL_OFFLINE') == '1':
+            from ScholarEval.utils.workflow_errors import ConfigurationError
+            raise ConfigurationError('Offline guard: starting a real Codex app-server is prohibited')
         try:
             self.timeout = float(os.environ.get('SCHOLAREVAL_CODEX_REQUEST_TIMEOUT', '300'))
             concurrency = int(os.environ.get('SCHOLAREVAL_CODEX_MAX_CONCURRENCY', '1'))
@@ -245,9 +250,9 @@ class CodexAppServerEngine:
             limits = self.client.request('account/rateLimits/read')
             self._report('Quota', quota_state(limits))
             if self.status['Quota'] == 'exhausted':
-                raise server_error({'codexErrorInfo': 'usageLimitExceeded'})
+                self._failure = server_error({'codexErrorInfo': 'usageLimitExceeded'})
             if self.status['Quota'] == 'unknown':
-                raise CodexQuotaError('Codex did not expose allowance state; cannot verify included usage before inference.')
+                self._failure = CodexQuotaError('Codex did not expose allowance state; cannot verify included usage before inference.')
             # Read only through the official executable, never token/config files.
             config = self.client.request('config/read', {'includeLayers': False})['config']
             self.thread_config = dict(RESTRICTED_CONFIG)
@@ -260,7 +265,12 @@ class CodexAppServerEngine:
             if path:
                 Path(path).parent.mkdir(parents=True, exist_ok=True)
                 self._cache = sqlite3.connect(path, check_same_thread=False)
+                self._cache.execute('PRAGMA synchronous=FULL')
                 self._cache.execute('CREATE TABLE IF NOT EXISTS responses (key TEXT PRIMARY KEY, text TEXT NOT NULL)')
+                self._cache.execute('CREATE TABLE IF NOT EXISTS completed_turns (key TEXT PRIMARY KEY, text TEXT NOT NULL)')
+                self._cache.execute('CREATE TABLE IF NOT EXISTS cache_integrity '
+                                    '(cache_table TEXT, key TEXT, sha256 TEXT NOT NULL, '
+                                    'PRIMARY KEY(cache_table, key))')
                 self._cache.commit()
             atexit.register(self.close)
         except (KeyError, TypeError, ValueError, AttributeError):
@@ -290,6 +300,38 @@ class CodexAppServerEngine:
         elif method == 'model/rerouted':
             self._failure = CodexModelError('Codex reported a model reroute; no substituted-model output will be accepted.')
 
+    def _cached_text(self, table: str, key: str) -> str | None:
+        """Preserve legacy rows; attest them on first read, then detect alteration."""
+        if table not in {'responses', 'completed_turns'}:
+            raise ValueError('Unknown cache table')
+        with self._cache_lock, self._cache:
+            row = self._cache.execute(f'SELECT text FROM {table} WHERE key=?', (key,)).fetchone()
+            checksum = self._cache.execute(
+                'SELECT sha256 FROM cache_integrity WHERE cache_table=? AND key=?', (table, key)).fetchone()
+            actual = hashlib.sha256(row[0].encode('utf-8')).hexdigest() if row else None
+            if checksum and checksum[0] != actual:
+                raise ScientificValidationError(
+                    f'Codex {table} cache integrity mismatch for {key}; original database preserved for diagnosis')
+            if row and not checksum:
+                self._cache.execute('INSERT OR IGNORE INTO cache_integrity VALUES(?,?,?)', (table, key, actual))
+            return row[0] if row else None
+
+    def _store_text(self, table: str, key: str, text: str) -> None:
+        if table not in {'responses', 'completed_turns'}:
+            raise ValueError('Unknown cache table')
+        # One write transaction preserves the first completed result across workers.
+        with self._cache_lock, self._cache:
+            self._cache.execute(f'INSERT OR IGNORE INTO {table} VALUES(?,?)', (key, text))
+            stored = self._cache.execute(f'SELECT text FROM {table} WHERE key=?', (key,)).fetchone()[0]
+            if stored != text:
+                raise ScientificValidationError(f'Conflicting completed Codex response for {key}; cache preserved')
+            actual = hashlib.sha256(text.encode('utf-8')).hexdigest()
+            checksum = self._cache.execute(
+                'SELECT sha256 FROM cache_integrity WHERE cache_table=? AND key=?', (table, key)).fetchone()
+            if checksum and checksum[0] != actual:
+                raise ScientificValidationError(f'Codex cache integrity mismatch for {key}; cache preserved')
+            self._cache.execute('INSERT OR IGNORE INTO cache_integrity VALUES(?,?,?)', (table, key, actual))
+
     def respond(self, user_input, temperature=0.7, top_p=0.95, max_tokens=40000, *, output_schema=None, **kwargs):
         if kwargs:
             raise CodexProtocolError('Unsupported Codex parameters: ' + ', '.join(sorted(kwargs)))
@@ -307,8 +349,6 @@ class CodexAppServerEngine:
         try:
             if self._closed:
                 raise CodexProcessError('Codex engine is closed.')
-            if self._failure:
-                raise self._failure
             with self._cache_lock:
                 if not self._warned:
                     LOG.warning('Codex ignores temperature, top_p and the legacy default max_tokens=40000; no sampling/output cap is promised.')
@@ -316,10 +356,17 @@ class CodexAppServerEngine:
             key = hashlib.sha256(json.dumps([2, self.version, self.model, self.effort,
                                             user_input, output_schema], sort_keys=True).encode()).hexdigest()
             if self._cache:
-                with self._cache_lock:
-                    cached = self._cache.execute('SELECT text FROM responses WHERE key=?', (key,)).fetchone()
-                if cached:
-                    return cached[0], 0, 0  # No new usage on resume.
+                cached = self._cached_text('responses', key)
+                if cached is not None:
+                    validate_output(cached, user_input, output_schema)
+                    metric('codex.response_cache_hits')
+                    return cached, 0, 0  # No new usage on resume.
+            if os.environ.get('SCHOLAREVAL_NO_LLM') == '1':
+                from ScholarEval.utils.workflow_errors import ConfigurationError
+                raise ConfigurationError('No-LLM guard: uncached Codex response refused')
+            if self._failure:
+                raise self._failure
+            metric('codex.calls_attempted')
             deadline = time.monotonic() + self.timeout
             try:
                 result = self._with_capacity_retry(user_input, output_schema, deadline)
@@ -335,9 +382,9 @@ class CodexAppServerEngine:
                     text = validate_output(fixed[0], user_input, output_schema)
                     result = text, result[1] + fixed[1], result[2] + fixed[2]
                 if self._cache:
-                    with self._cache_lock:
-                        self._cache.execute('INSERT OR REPLACE INTO responses VALUES (?, ?)', (key, text))
-                        self._cache.commit()
+                    self._store_text('responses', key, text)
+                metric('codex.input_tokens', result[1])
+                metric('codex.output_tokens', result[2])
                 return text, result[1], result[2]
             except CodexError as error:
                 # Fail all queued work immediately; do not repeatedly consume quota.
@@ -350,9 +397,18 @@ class CodexAppServerEngine:
             self._slots.release()
 
     def _with_capacity_retry(self, messages, schema, deadline):
+        raw_key = hashlib.sha256(json.dumps([self.version, self.model, self.effort, messages, schema], sort_keys=True).encode('utf-8')).hexdigest()
+        if self._cache:
+            row = self._cached_text('completed_turns', raw_key)
+            if row is not None:
+                metric('codex.completed_turn_cache_hits')
+                return row, 0, 0
         for attempt in range(3):
             try:
-                return self._infer(messages, schema, deadline)
+                result = self._infer(messages, schema, deadline)
+                if self._cache:
+                    self._store_text('completed_turns', raw_key, result[0])
+                return result
             except CodexCapacityError:
                 if attempt == 2:
                     raise

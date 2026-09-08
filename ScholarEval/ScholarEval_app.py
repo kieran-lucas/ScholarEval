@@ -28,7 +28,7 @@ def monitor_progress_with_details(process, progress_file, status_placeholder, pr
         time.sleep(1)
         if progress_file.exists():
             try:
-                with open(progress_file, 'r') as f:
+                with open(progress_file, 'r', encoding='utf-8') as f:
                     progress_data = json.load(f)
                 
                 current = progress_data.get('current', 0)
@@ -263,7 +263,7 @@ with col2:
                 
                 # Display extracted methods
                 try:
-                    with open(soundness_dir / "methods.json", 'r') as f:
+                    with open(soundness_dir / "methods.json", 'r', encoding='utf-8') as f:
                             methods_data = json.load(f)
                             display_raw_json(methods_data, "Extracted Methods")
                 except Exception as e:
@@ -284,7 +284,7 @@ with col2:
                 
                 # Display generated queries
                 try:
-                    with open(soundness_dir / "queries.json", 'r') as f:
+                    with open(soundness_dir / "queries.json", 'r', encoding='utf-8') as f:
                         queries_data = json.load(f)
                     display_raw_json(queries_data, "Generated Search Queries")
                 except Exception as e:
@@ -360,11 +360,11 @@ with col2:
 
                 meta_review_md = soundness_dir / "meta_review.md"
                 # Load the meta review
-                with open(meta_review_md, 'r') as f:
+                with open(meta_review_md, 'r', encoding='utf-8') as f:
                     meta_review_content = f.read()
 
                 # Load the TLDR
-                with open(tldr_file, 'r') as f:
+                with open(tldr_file, 'r', encoding='utf-8') as f:
                     tldr_content = f.read()
 
                 # Display review inside collapsible expander
@@ -452,7 +452,7 @@ with col2:
                 # Display extracted dimensions and contributions
                 try:
                     dimensions_list = []
-                    with open(contribution_dir / "dimensions_contributions.jsonl", 'r') as f:
+                    with open(contribution_dir / "dimensions_contributions.jsonl", 'r', encoding='utf-8') as f:
                             for line in f:
                                 if line.strip():
                                     dimensions_list.append(json.loads(line))
@@ -475,7 +475,7 @@ with col2:
                 
                 # Display generated queries
                 try:
-                    with open(contribution_dir / "contribution_queries.json", 'r') as f:
+                    with open(contribution_dir / "contribution_queries.json", 'r', encoding='utf-8') as f:
                         queries_data = json.load(f)
                     display_raw_json(queries_data, "Generated Contribution Queries")
                 except Exception as e:
@@ -509,7 +509,7 @@ with col2:
                 
                 # Display paper summary
                 try:
-                    with open(contribution_dir / "contribution_papers.json", 'r') as f:
+                    with open(contribution_dir / "contribution_papers.json", 'r', encoding='utf-8') as f:
                         papers_data = json.load(f)
                     st.info(f"Found {len(papers_data)} papers from literature search")
                     display_raw_json(papers_data, "Extracted Papers")
@@ -531,7 +531,7 @@ with col2:
                 
                 # Display filtered papers summary
                 try:
-                    with open(contribution_dir / "filtered_contribution_papers.json", 'r') as f:
+                    with open(contribution_dir / "filtered_contribution_papers.json", 'r', encoding='utf-8') as f:
                         filtered_papers = json.load(f)["papers"]
                     # Filter papers with relevance_score > 3
                     original_count = len(filtered_papers)
@@ -555,7 +555,7 @@ with col2:
                 
                 # Display augmented papers summary
                 try:
-                    with open(contribution_dir / "augmented_contribution_papers.json", 'r') as f:
+                    with open(contribution_dir / "augmented_contribution_papers.json", 'r', encoding='utf-8') as f:
                         augmented_papers = json.load(f)
                     st.info(f"Added {len(augmented_papers)-original_count} papers after augmentation")
                 except Exception as e:
@@ -587,7 +587,7 @@ with col2:
                 
                 # Display final papers summary
                 try:
-                    with open(contribution_dir / "final_contribution_papers.json", 'r') as f:
+                    with open(contribution_dir / "final_contribution_papers.json", 'r', encoding='utf-8') as f:
                         final_papers = json.load(f)["papers"]
                     high_relevance_final_papers = [paper for paper in final_papers if paper.get('relevance_score', 0) >= 3]
                     st.info(f"Final set: {len(high_relevance_final_papers)} papers for comparison analysis")
@@ -645,7 +645,7 @@ with col2:
                 st.success("Contribution review completed!")
 
                 # Show final result with timing
-                with open(review_file, 'r') as f:
+                with open(review_file, 'r', encoding='utf-8') as f:
                     contribution_text = f.read()
 
                 end_time = time.time()
@@ -670,6 +670,7 @@ with col2:
                 )
 
             except Exception as e:
-                st.error(f"Contribution review failed: {e}")            finally:
+                st.error(f"Contribution review failed: {e}")
+            finally:
                 if codex_run:
                     codex_run.close()

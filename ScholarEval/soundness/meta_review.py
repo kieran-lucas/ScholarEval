@@ -79,7 +79,7 @@ def process_reference(rp, method, related_work, rw, llm, su, llm_cost, litellm_n
     else:
         print("Processing method:", method)
         response, input_tokens, output_tokens = llm.respond(prompt, temperature=0.3)
-        print("Response received", response)
+        print(f'Meta-review response received for {method}', flush=True)
         clean_analysis = su.extract_json_output(response)
         clean_analysis['n_related_work'] = rw
         
@@ -100,6 +100,8 @@ def process_reference(rp, method, related_work, rw, llm, su, llm_cost, litellm_n
 def convert_json_to_markdown(analysis_data, output_path):
     """Convert the JSON analysis to markdown format"""
     with open(output_path, 'w', encoding='utf-8') as f:
+        if all(v.get('n_related_work', 0) == 0 for v in analysis_data.values()):
+            f.write('No related work was retrieved. Soundness remains undetermined from this evidence.\n')
         
         for method_name, analysis in analysis_data.items():
             if (analysis.get('support', '') == 'No related work found' and
@@ -144,11 +146,11 @@ def save_bibliography(citation_dict, output_path):
         sorted_corpus_ids.sort(key=lambda x: x[0])
         
         # Write each reference using get_paper_details
-        for i, (corpus_id, url) in enumerate(sorted_corpus_ids, 1):
+        details = s2.get_paper_bulk(['CorpusId:' + cid for cid, _ in sorted_corpus_ids])
+        for i, ((corpus_id, url), metadata) in enumerate(zip(sorted_corpus_ids, details), 1):
             try:
                 # Get paper details using the corpus_id with CorpusId: prefix
-                paper_details = s2.get_paper_details(f"CorpusId:{corpus_id}")
-                print(f"Paper details fetched: {paper_details}")
+                paper_details = metadata or {}
                 # Extract metadata
                 title = paper_details.get('title', 'No Title')
                 authors = paper_details.get('authors', [])
@@ -175,7 +177,6 @@ def save_bibliography(citation_dict, output_path):
                 f.write(f"   Citation Count: {citation_count}\n")
                 f.write(f"   URL: {url}\n")
                 f.write(f"   Corpus ID: {corpus_id}\n\n")
-                time.sleep(1)
             except RetrievalError:
                 raise
             except Exception as e:
@@ -211,6 +212,8 @@ def main():
     parser.add_argument("--bibliography_file", required=False, help="Path to save bibliography/references txt file")
     parser.add_argument("--cost_log_file", help="Path to centralized cost log file")
     args = parser.parse_args()
+    if os.environ.get('SCHOLAREVAL_LLM_BACKEND') == 'codex':
+        args.max_workers = int(os.environ.get('SCHOLAREVAL_CODEX_MAX_CONCURRENCY', '1'))
     
     API_KEY = os.environ.get("API_KEY")
     API_ENDPOINT = os.environ.get("API_ENDPOINT")
@@ -219,14 +222,14 @@ def main():
     
     with open(args.research_plan, "r", encoding="utf-8") as f:
         rp = f.read()
-    with open(args.mr_analysis_file) as f:
+    with open(args.mr_analysis_file, encoding='utf-8') as f:
         mr_analysis = json.load(f)["analysis"]
-    with open(args.methods_and_ref_file) as f:
+    with open(args.methods_and_ref_file, encoding='utf-8') as f:
         clean_methods_refs = json.load(f)
         
     s2 = SemanticScholar(os.environ.get("S2_API_KEY"))  
     
-    unique_paper_ids = list(set(["CorpusId:" + ref for references in clean_methods_refs.values() for ref in references]))
+    unique_paper_ids = sorted(set(["CorpusId:" + ref for references in clean_methods_refs.values() for ref in references]))
     batch_size = 500
     citations = []
     for i in range(0, len(unique_paper_ids), batch_size):
@@ -307,17 +310,24 @@ def main():
                 rw_tmp += f"[method]\n{a.get('method', 'no method found')}\n[results]\n{a.get('results', 'no results found')}\n[context]\n{a.get('context', 'no context found')}\n"
             related_work.append(rw_tmp + f"[end related work {rw}]\n")
         related_work = '\n'.join(related_work)
-        print(related_work)
+        print(f'Preparing {len(related_work_data)} evidence records for {method}', flush=True)
         llm, su = get_thread_instances()
         return method, process_reference(rp, method, related_work, len(related_work_data), llm, su, llm_cost, args.litellm_name)
     
         
     # Create tasks for parallel processing
     tasks = [(method, analysis) for method, analysis in mr_analysis.items()]
+    from ScholarEval.utils.durable import ItemStore
+    from ScholarEval.utils.checkpoints import has_error, valid_meta_review
+    def durable_review(task):
+        return ItemStore.current('meta_review').run([rp, task, citation_dict],
+            lambda: process_ref_wrapper(task),
+            lambda value: isinstance(value, (list, tuple)) and len(value) == 2
+                and valid_meta_review(value[1]) and not has_error(value))
     
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
         future_to_task = {
-            executor.submit(process_ref_wrapper, task): task 
+            executor.submit(durable_review, task): task
             for task in tasks
         }
         
@@ -332,10 +342,9 @@ def main():
                     total_output_tokens += result.get('output_tokens', 0)
                     
             except Exception as e:
-                task = future_to_task[future]
-                if isinstance(e, (CodexError, RetrievalError)):
-                    raise
-                print(f"Error processing {task}: {e}")
+                for pending in future_to_task:
+                    pending.cancel()
+                raise
     
     print(f"Meta review cost: ${total_cost:.4f} (Input: {total_input_tokens}, Output: {total_output_tokens})")
     
@@ -346,12 +355,12 @@ def main():
             "input_tokens": total_input_tokens,
             "output_tokens": total_output_tokens
         }
-        with open(args.cost_log_file, 'a') as f:
+        with open(args.cost_log_file, 'a', encoding='utf-8') as f:
             json.dump(cost_entry, f)
             f.write('\n')
     
     # Save progress after each method
-    with open(args.output_file, 'w') as f:
+    with open(args.output_file, 'w', encoding='utf-8') as f:
         json.dump({
             'analysis': all_methods_analysis
         }, f, indent=4)

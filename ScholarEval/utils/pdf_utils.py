@@ -9,15 +9,17 @@ from urllib.parse import urljoin
 import json
 from pathlib import Path
 from .checkpoints import atomic_json, digest
+from .durable import atomic_bytes, metric
+import time
 
 class FastPDFDownloader:
-    def __init__(self, max_workers=80, timeout=8, pdf_dir="pdfs", email=None, log_path=None):
+    def __init__(self, max_workers=8, timeout=30, pdf_dir="pdfs", email=None, log_path=None):
         self.max_workers = max_workers
         self.timeout = timeout
         self.pdf_dir = pdf_dir
         self.email = email 
         self.unpaywall_base_url = "https://api.unpaywall.org/v2"
-        self.max_attempts = int(os.environ.get('SCHOLAREVAL_PDF_MAX_ATTEMPTS', '1'))
+        self.max_attempts = int(os.environ.get('SCHOLAREVAL_PDF_MAX_ATTEMPTS', '3'))
         if self.max_attempts < 1:
             raise ValueError('SCHOLAREVAL_PDF_MAX_ATTEMPTS must be >= 1')
         self.checkpoint_path = Path(pdf_dir) / 'download_progress.json'
@@ -211,13 +213,14 @@ class FastPDFDownloader:
                     if response.status == 200:
                         content = await response.read()
                         if self._is_valid_pdf_content(content):
-                            with open(pdf_fp, "wb") as f:
-                                f.write(content)
+                            atomic_bytes(pdf_fp, content)
                             return pdf_fp
                         self._note_download(corpus_id, str(response.url), 'HTTP 200 response is not PDF content')
                     elif response.status == 429:
                         await asyncio.sleep(1)  # Brief pause for rate limiting
             except Exception as error:
+                if isinstance(error, OSError) and getattr(error, 'errno', None) in (13, 28):
+                    raise
                 self._note_download(corpus_id, pdf_url, type(error).__name__)
                 continue
 
@@ -258,12 +261,13 @@ class FastPDFDownloader:
             if response.status_code == 200:
                 content = response.content
                 if self._is_valid_pdf_content(content):
-                    with open(pdf_fp, "wb") as f:
-                        f.write(content)
+                    atomic_bytes(pdf_fp, content)
                     return pdf_fp
                 self._note_download(corpus_id, str(response.url), 'HTTP 200 response is not PDF content')
 
         except Exception as error:
+            if isinstance(error, OSError) and getattr(error, 'errno', None) in (13, 28):
+                raise
             self._note_download(corpus_id, pdf_url, type(error).__name__)
 
         return None
@@ -310,8 +314,7 @@ class FastPDFDownloader:
                             if pdf_response.status == 200:
                                 content = await pdf_response.read()
                                 if self._is_valid_pdf_content(content):
-                                    with open(pdf_fp, "wb") as f:
-                                        f.write(content)
+                                    atomic_bytes(pdf_fp, content)
                                     return pdf_fp
                                 self._note_download(corpus_id, str(pdf_response.url), 'HTTP 200 response is not PDF content')
                     except Exception as error:
@@ -351,6 +354,10 @@ class FastPDFDownloader:
             atomic_json(self.checkpoint_path, self.download_records)
             return str(path)
         self.active_downloads[str(corpus_id)] = record
+        # Retry temporary host failures after a cooldown on a later invocation;
+        # a completed evidence generation still remains reproducible on resume.
+        if record.get('availability') == 'PDF_DOWNLOAD_RETRYABLE' and time.time() >= record.get('retry_at', 0):
+            record['attempts'] = 0
         try:
             while record['attempts'] < self.max_attempts:
                 record['attempts'] += 1
@@ -360,14 +367,26 @@ class FastPDFDownloader:
                 try:
                     result = await self._download_pdf_attempt_async(session, pdf_url, corpus_id, save_dir, try_unpaywall)
                 except Exception as error:
+                    if isinstance(error, OSError) and getattr(error, 'errno', None) in (13, 28):
+                        raise
                     self._note_download(corpus_id, pdf_url, type(error).__name__)
                     result = None
                 if result and self.valid_pdf(result):
                     record['status'] = 'downloaded'
+                    record['availability'] = 'PDF_AVAILABLE'
+                    metric('pdf.downloads')
                     return result
                 if result:
                     self._note_download(corpus_id, pdf_url, 'Downloaded file is not a readable PDF')
+                if record['attempts'] < self.max_attempts:
+                    metric('pdf.retries')
+                    await asyncio.sleep(min(30, 2 ** record['attempts']))
             record['status'] = 'full_text_unavailable'
+            reasons = ' '.join(f.get('reason', '') for f in record['failures'])
+            transient = any(token in reasons for token in ('429', '500', '502', '503', '504', 'Timeout', 'Connection', 'Connector'))
+            record['availability'] = 'PDF_DOWNLOAD_RETRYABLE' if transient else 'PDF_DOWNLOAD_TERMINAL'
+            record['retry_at'] = time.time() + 300 if transient else None
+            metric('pdf.' + record['availability'])
             record['failure_reason'] = 'Bounded download attempts exhausted; no readable PDF'
             return None
         finally:

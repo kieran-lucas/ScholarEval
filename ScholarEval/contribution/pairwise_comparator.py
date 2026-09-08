@@ -98,6 +98,8 @@ def main():
     parser.add_argument("--max_workers", type=int, default=5, help="Maximum number of parallel workers")
     parser.add_argument("--cost_log_file", help="Path to centralized cost log file")
     args = parser.parse_args()
+    if os.environ.get('SCHOLAREVAL_LLM_BACKEND') == 'codex':
+        args.max_workers = int(os.environ.get('SCHOLAREVAL_CODEX_MAX_CONCURRENCY', '1'))
 
     logging.info("Loading research plan and papers")
     research_plan_text = load_file(args.research_plan)
@@ -142,7 +144,7 @@ def main():
     def compare_paper(paper):
         """Compare a single paper using thread-local LLM instance."""
         nonlocal total_cost, total_input_tokens, total_output_tokens
-        logging.info(f"Comparing with paper: {paper.get('title')[:80]}")
+        logging.info(f"Comparing with paper: {str(paper.get('title') or '')[:80]}")
         llm, su = get_thread_instances()
         
         try:
@@ -177,42 +179,30 @@ def main():
                 "output_tokens": output_tokens
             }
         except Exception as e:
-            if isinstance(e, CodexError):
-                raise
-            logging.error(f"Failed comparison for paper '{paper.get('title')}': {e}")
-            return {
-                "paper_title": paper.get("title"),
-                "paper_authors": paper.get("authors"),
-                "paper_abstract": paper.get("abstract"),
-                "paper_venue": paper.get("venue"),
-                "paper_pdf": paper.get("openAccessPdf"),
-                "citation_count": paper.get("citationCount"),
-                "publication_date": paper.get("publicationDate"),
-                "comparison": {"error": f"Comparison failed: {str(e)}"},
-                "cost": 0,
-                "input_tokens": 0,
-                "output_tokens": 0
-            }
-
+            raise
     # Process papers in parallel
     results = []
+    from ScholarEval.utils.durable import ItemStore
+    from ScholarEval.utils.checkpoints import has_error, valid_comparison
+    def durable_compare(paper):
+        return ItemStore.current('pairwise').run([research_plan_text, aggregated_dimensions, paper],
+            lambda: compare_paper(paper), lambda value: valid_comparison(value, dimensions) and not has_error(value))
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
         # Submit all tasks
         future_to_paper = {
-            executor.submit(compare_paper, paper): paper 
+            executor.submit(durable_compare, paper): paper
             for paper in valid_papers
         }
         
         # Collect results
-        for future in tqdm(as_completed(future_to_paper), total=len(valid_papers), desc="Comparing papers"):
+        for future in tqdm(future_to_paper, total=len(valid_papers), desc="Comparing papers"):
             try:
                 result = future.result()
                 results.append(result)
             except Exception as e:
-                if isinstance(e, CodexError):
-                    raise
-                paper = future_to_paper[future]
-                logging.error(f"Error processing paper {paper.get('title')}: {e}")
+                for pending in future_to_paper:
+                    pending.cancel()
+                raise
 
     print(f"Total LLM cost for pairwise_comparator: ${total_cost:.6f}")
     logging.info(f"Saving {len(results)} pairwise comparisons to {args.output_file}")
@@ -225,7 +215,7 @@ def main():
             "input_tokens": total_input_tokens,
             "output_tokens": total_output_tokens
         }
-        with open(args.cost_log_file, 'a') as f:
+        with open(args.cost_log_file, 'a', encoding='utf-8') as f:
             json.dump(cost_entry, f)
             f.write('\n')
     

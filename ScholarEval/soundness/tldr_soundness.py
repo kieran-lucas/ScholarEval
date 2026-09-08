@@ -41,7 +41,7 @@ def main():
 
     with open(args.input_file, "r", encoding="utf-8") as f:
         rp = f.read()
-    with open(args.meta_review_file) as f:
+    with open(args.meta_review_file, encoding='utf-8') as f:
         meta_review = json.load(f)["analysis"]
 
     avg_soundness_score = compute_average_soundness_score(meta_review)
@@ -102,6 +102,12 @@ JSON formatting requirements:
 
     response, input_tokens, output_tokens = llm.respond(prompt, temperature=0.2)
     tldr = su.extract_json_output(response)
+    from ScholarEval.utils.checkpoints import strings
+    from ScholarEval.utils.workflow_errors import ScientificValidationError
+    if not (isinstance(tldr, dict) and all(isinstance(tldr.get(k), (str, list)) and bool(tldr[k])
+            for k in ('strengths_summary', 'weaknesses_summary'))
+            and strings(tldr.get('top_3_suggestions')) and len(tldr['top_3_suggestions']) == 3):
+        raise ScientificValidationError('Soundness summary missing required scientific structure')
 
     if args.litellm_name:
         if args.litellm_name == "meta_llama/Llama-3.3-70B-Instruct":
@@ -122,7 +128,7 @@ JSON formatting requirements:
             "input_tokens": input_tokens,
             "output_tokens": output_tokens
         }
-        with open(args.cost_log_file, 'a') as f:
+        with open(args.cost_log_file, 'a', encoding='utf-8') as f:
             json.dump(cost_entry, f)
             f.write('\n')
 

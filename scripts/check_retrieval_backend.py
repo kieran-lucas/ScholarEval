@@ -9,6 +9,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ScholarEval.utils.grobid import GrobidService, GrobidStartupError
 from ScholarEval.utils.retrieval_http import RetrievalHTTP, RetrievalError
+from ScholarEval.utils.workflow_errors import ConfigurationError
 
 
 def main():
@@ -51,7 +52,7 @@ def main():
         healthy = bool(compatible) and any(c['State'].get('Running') for c in compatible) and service.healthy()
         print('GROBID health: ' + ('PASS' if healthy else 'NOT READY'))
         ready &= healthy
-    except GrobidStartupError as error:
+    except (GrobidStartupError, ConfigurationError) as error:
         print(str(error))
         ready = False
     http = RetrievalHTTP(max_retries=0)
